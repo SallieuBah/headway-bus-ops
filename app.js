@@ -16,7 +16,8 @@ const fmtTime = m => { m = ((Math.round(m) % 1440) + 1440) % 1440; return `${pad
 const fmtNum = n => Math.round(n).toLocaleString('en-US');
 const uid = p => p + Math.random().toString(36).slice(2, 7).toUpperCase();
 const hashStr = s => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
-const localDate = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+const dayKey = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const localDate = () => dayKey(new Date());
 function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
 const rand01 = key => rng(hashStr(key))();
 // smooth value noise in [0,1]; the same key and time give the same value on every device
@@ -194,6 +195,16 @@ function seedState() {
     const seats = new Set();
     while (seats.size < taken) seats.add(1 + Math.floor(R() * 44));
     for (const seat of seats) S0.bookings.push({ id: uid('TK-'), date: localDate(), dep, seat, name: pick(coachNames), type: R() > .8 ? 'Student' : 'Adult', fare: 9.5, issued: now - R() * 864e5 });
+  }
+  // a week of earlier coach sales, so reports have history to show
+  const FARES = [['Adult', 1], ['Adult', 1], ['Adult', 1], ['Student', .6], ['Senior', .5], ['Child', .4]];
+  for (let back = 1; back <= 6; back++) {
+    const day = new Date(); day.setDate(day.getDate() - back); const date = dayKey(day); const wk = [.8, 1, 1, 1, 1.1, 1.25, .9][day.getDay()];
+    for (const dep of coachDepartures()) {
+      const peak = Math.exp(-((dep / 60 - 8) ** 2) / 6) + Math.exp(-((dep / 60 - 17) ** 2) / 8);
+      const n = Math.min(44, Math.round((6 + 22 * peak + R() * 8) * wk));
+      for (let seat = 1; seat <= n; seat++) { const [type, mult] = pick(FARES); S0.bookings.push({ id: uid('TK-'), date, dep, seat, name: pick(coachNames), type, fare: Math.round(9.5 * mult * 100) / 100, issued: day.getTime() - R() * 864e5 }); }
+    }
   }
 
   // messages
@@ -534,6 +545,8 @@ function raiseAlert(a) {
   toast(`${a.title}${a.busId ? ' · ' + a.busId : ''}`, a.severity === 'critical' ? 'crit' : a.severity === 'warning' ? 'warn' : 'info', 'alert');
   updateChrome(); save();
 }
+// minutes behind schedule at a given epoch second; drives the live map and the on-time report
+const delayAt = (id, sec) => Math.round(-1.5 + 12 * noise(id + 'd', sec / 300) ** 2);
 function paxSoFar(m = nowMin()) { let p = 0; for (let x = 330; x < m; x += 5) p += demand(x / 60) * Math.min(5, m - x) / 60; return Math.round(p); }
 function simulate() {
   if (!S) return;
@@ -546,7 +559,7 @@ function simulate() {
     const m = x % 2; b.t = m < 1 ? m : 2 - m; b.dir = m < 1 ? 1 : -1;
     const nearStop = g.stopT.some(t => Math.abs(t - b.t) < .006);
     b.speed = nearStop ? 0 : Math.round(16 + 38 * noise(b.id + 's', now / 25));
-    b.delay = Math.round(-1.5 + 12 * noise(b.id + 'd', now / 300) ** 2) + (b.holdUntil > Date.now() ? 2 : 0);
+    b.delay = delayAt(b.id, now) + (b.holdUntil > Date.now() ? 2 : 0);
     b.occ = Math.round(b.capacity * clamp(.1 + .8 * noise(b.id + 'o', now / 120) * (.35 + demand(hour) / 1700), .03, 1.02));
     b.energy = clamp(b.energyBase - Math.max(0, hour - 5.5) * (b.fuel === 'Electric' ? 3.4 : 2.4), 4, 100);
     if (b.energy < 15) raiseAlert({ id: `low-${b.id}-${localDate()}`, severity: 'warning', title: b.fuel === 'Electric' ? 'Low battery' : 'Low fuel', detail: `${b.id} at ${Math.round(b.energy)}%. Plan a swap at the next layover.`, busId: b.id, type: 'energy' });
@@ -584,7 +597,7 @@ function areaChart({ series, labels, w = 640, h = 220, fmt = fmtNum, xEvery = 2,
   });
   return out + '</svg>';
 }
-function barChart({ items, w = 640, h = 220, fmt = fmtNum, color = 'var(--info)' }) {
+function barChart({ items, w = 640, h = 220, fmt = fmtNum, color = 'var(--info)', every = 1 }) {
   const P = { l: 44, r: 10, t: 18, b: 26 };
   const max = niceMax(Math.max(...items.map(i => i.value), 1));
   const iw = w - P.l - P.r; const ih = h - P.t - P.b; const bw = iw / items.length;
@@ -594,7 +607,7 @@ function barChart({ items, w = 640, h = 220, fmt = fmtNum, color = 'var(--info)'
   items.forEach((it, i) => {
     const x = P.l + i * bw + bw * .18; const bwi = bw * .64;
     out += `<rect x="${x}" y="${Y(it.value)}" width="${bwi}" height="${Y(0) - Y(it.value)}" rx="4" fill="${it.color || color}" ${it.dim ? 'fill-opacity=".45"' : ''}/>`;
-    out += `<text x="${x + bwi / 2}" y="${h - 6}" text-anchor="middle">${esc(it.label)}</text>`;
+    if ((items.length - 1 - i) % every === 0) out += `<text x="${x + bwi / 2}" y="${h - 6}" text-anchor="middle">${esc(it.label)}</text>`;
     if (it.showVal) out += `<text class="val" x="${x + bwi / 2}" y="${Y(it.value) - 5}" text-anchor="middle">${fmt(it.value)}</text>`;
   });
   return out + '</svg>';
@@ -1398,30 +1411,159 @@ function messageModal(b) {
 }
 
 // ---- Reports
+// Coach ticket sales, alerts and maintenance are recorded data. Boardings and on-time figures come from the
+// service model that moves the buses, until a ticketing or AVL feed replaces it.
+let repDays = 7;
+let repCache = null; // cloud mode: grouped totals from the report_* database functions
+const REP_RANGES = [[1, 'Today'], [7, '7 days'], [30, '30 days']];
+const ALERT_LABEL = { delay: 'Delays', crowd: 'Crowding', fault: 'Vehicle faults', energy: 'Energy', safety: 'Safety', ops: 'Operations', detour: 'Detours', driver: 'Driver reports', other: 'Other' };
+const ALERT_COLOR = { delay: 'var(--warn)', crowd: 'var(--accent)', fault: 'var(--crit)', energy: 'var(--ok)', safety: 'var(--crit)', ops: 'var(--info)', detour: 'var(--info)', driver: 'var(--accent)', other: 'var(--muted)' };
+const FARE_COLOR = { Adult: 'var(--info)', Student: 'var(--accent)', Senior: 'var(--ok)', Child: 'var(--warn)' };
+const repDayList = n => Array.from({ length: n }, (_, i) => { const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - (n - 1) + i); return d; });
+function paxModelled(d) {
+  if (dayKey(d) === localDate()) return Math.round(S.passengersToday);
+  return Math.round(paxSoFar(1380) * [.55, 1, 1, 1, 1, 1.04, .7][d.getDay()] * (.94 + rand01('pax' + dayKey(d)) * .12));
+}
+// share of 15-minute samples within 3 min of schedule, per line, with the live map's delay model
+function otpModelled(days) {
+  const out = {}; const end = Date.now();
+  for (const r of S.routes) {
+    const buses = S.buses.filter(b => b.routeId === r.id); let ok = 0, n = 0;
+    for (const d of days) for (let m = 330; m < 1380; m += 15) {
+      const t = d.getTime() + m * 60000; if (t > end) break;
+      for (const b of buses) { n++; if (delayAt(b.id, t / 1000) <= 3) ok++; }
+    }
+    out[r.id] = n ? Math.round(ok / n * 100) : null;
+  }
+  return out;
+}
+function salesFrom(bookings) {
+  const m = new Map();
+  for (const b of bookings) { const k = `${b.date}|${b.dep}|${b.type}`; const x = m.get(k) || { date: b.date, dep: b.dep, type: b.type, tickets: 0, revenue: 0 }; x.tickets++; x.revenue += +b.fare || 0; m.set(k, x); }
+  return [...m.values()];
+}
+// Recorded data for the range. Demo mode reads S; signed in, earlier days come from the database (cached for a minute)
+// and today's sales from S so new tickets show at once. sales is null when the role can't read bookings.
+function repData(days) {
+  const from = dayKey(days[0]), to = dayKey(days[days.length - 1]), today = localDate();
+  if (MODE !== 'cloud') {
+    const inR = k => k >= from && k <= to;
+    return { sales: salesFrom(S.bookings.filter(b => inR(b.date))), alerts: S.alerts.map(a => ({ day: dayKey(new Date(a.time)), type: a.type || 'other', severity: a.severity, status: a.status, n: 1 })).filter(a => inR(a.day)) };
+  }
+  const key = from + to + role();
+  if (!repCache || repCache.key !== key || (!repCache.loading && Date.now() - repCache.at > 60000)) repFetch(key, days, from, to);
+  const c = repCache;
+  return { loading: c.loading && !c.alerts, error: c.error, alerts: c.alerts, sales: c.sales && [...c.sales.filter(x => x.date !== today), ...salesFrom(bookingsToday())] };
+}
+async function repFetch(key, days, from, to) {
+  repCache = { ...(repCache?.key === key ? repCache : { alerts: null, sales: null }), key, at: Date.now(), loading: true };
+  const end = new Date(days[days.length - 1]); end.setDate(end.getDate() + 1);
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  try {
+    const [sa, al] = await Promise.all([
+      can('tickets') ? sb.rpc('report_ticket_sales', { from_date: from, to_date: to }) : { data: null },
+      sb.rpc('report_alerts', { from_ts: days[0].toISOString(), to_ts: end.toISOString(), tz })
+    ]);
+    const err = sa.error || al.error; if (err) throw err;
+    repCache = { key, at: Date.now(), loading: false, error: null,
+      sales: sa.data && sa.data.map(x => ({ date: x.dep_date, dep: x.dep, type: x.fare_type, tickets: +x.tickets, revenue: +x.revenue })),
+      alerts: al.data.map(x => ({ day: x.day, type: x.type, severity: x.severity, status: x.status, n: +x.alerts })) };
+  } catch (e) {
+    repCache = { key, at: Date.now(), loading: false, error: e.message || 'network error', sales: null, alerts: null };
+  }
+  if (current === VIEWS.reports) rerender(true);
+}
+function downloadText(text, name, type = 'text/csv') {
+  try {
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name;
+    document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  } catch (e) { toast('Download was blocked here. Use Copy CSV instead.', 'warn', 'alert'); }
+}
 VIEWS.reports = {
-  title: 'Reports', crumb: 'Last 7 days',
+  title: 'Reports', crumb: () => repDays === 1 ? 'Today' : `Last ${repDays} days`,
   render(el) {
-    const R = rng(77);
-    const days = Array.from({ length: 7 }, (_, i) => { const d = new Date(); d.setDate(d.getDate() - 6 + i); return d; });
-    const ride = days.map((d, i) => { const wk = d.getDay() === 0 ? .55 : d.getDay() === 6 ? .7 : 1; return i === 6 ? Math.round(S.passengersToday) : Math.round(17800 * wk * (.93 + R() * .12)); });
-    const total = ride.reduce((a, b) => a + b, 0);
-    const byRoute = S.routes.map(r => ({ label: `${r.id}`, value: Math.round(total * (r.kind === 'coach' ? .03 : (.12 + R() * .18)) * r.fare), color: r.color }));
-    const otp = S.routes.map(r => ({ label: `Line ${r.id}`, value: Math.round(78 + R() * 18), color: r.color }));
-    const ev = S.buses.filter(b => b.fuel === 'Electric').length; const km = S.buses.reduce((a, b) => a + (b.status === 'service' ? 1 : 0), 0) * 230 * 7;
-    const csv = ['date,boardings', ...days.map((d, i) => `${d.toISOString().slice(0, 10)},${ride[i]}`), '', 'line,revenue', ...byRoute.map(r => `${r.label},${r.value}`)].join('\n');
-    el.innerHTML = `<div class="big-stats">
-        <div class="big-stat"><div class="l">Boardings, 7 days</div><div class="v">${fmtNum(total)}</div><div class="d">avg ${fmtNum(total / 7)} per day</div></div>
-        <div class="big-stat"><div class="l">Fare revenue</div><div class="v">${moneyK(byRoute.reduce((a, b) => a + b.value, 0))}</div><div class="d">incl. coach seat sales</div></div>
-        <div class="big-stat"><div class="l">Service km operated</div><div class="v">${fmtNum(km)}</div><div class="d">99.2% of scheduled km</div></div>
-        <div class="big-stat"><div class="l">CO₂ avoided by e-buses</div><div class="v" style="color:var(--ok)">${(ev * 230 * 7 * 1.1 / 1000).toFixed(1)} t</div><div class="d">${ev} electric of ${S.buses.length} vehicles</div></div></div>
+    const days = repDayList(repDays); const one = repDays === 1; const today = localDate();
+    const from = dayKey(days[0]), to = dayKey(days[days.length - 1]);
+    const D = repData(days);
+    const coach = S.routes.find(r => r.kind === 'coach'); const seats = coach?.seats || 44;
+    const empty = (ic, txt) => `<div class="empty">${icon(ic)}<div>${txt}</div></div>`;
+    const modelled = '<span class="spacer"></span><span class="chip nodot" title="From the service model until a ticketing or AVL feed is connected">Modelled</span>';
+    const dayLabel = d => repDays <= 7 ? d.toLocaleDateString('en-GB', { weekday: 'short' }) : d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+    const every = repDays > 7 ? Math.ceil(repDays / 8) : 1;
+    const k1 = v => v >= 1000 ? (v / 1000).toFixed(v % 1000 ? 1 : 0) + 'k' : String(Math.round(v));
+    const moneyAxis = v => S.settings.currency + k1(v);
+
+    // boardings (modelled): per day, or per hour for today
+    const pax = days.map(paxModelled); const paxTotal = pax.reduce((a, b) => a + b, 0);
+    const m = nowMin();
+    const paxItems = one
+      ? Array.from({ length: 18 }, (_, i) => { const h = 5 + i; const v = h * 60 < m ? paxSoFar(Math.min(m, h * 60 + 60)) - paxSoFar(h * 60) : 0; return { label: pad(h), value: Math.max(0, v), color: 'var(--info)' }; })
+      : days.map((d, i) => ({ label: dayLabel(d), value: pax[i], color: dayKey(d) === today ? 'var(--accent)' : 'var(--info)', showVal: repDays <= 7 }));
+
+    // coach ticket sales (recorded)
+    const sales = D.sales;
+    const sum = (rows, f) => rows.reduce((a, x) => a + f(x), 0);
+    const tickets = sales ? sum(sales, x => x.tickets) : 0, revenue = sales ? sum(sales, x => x.revenue) : 0;
+    const deps = coachDepartures();
+    const revItems = !sales ? [] : one
+      ? deps.map(dp => ({ label: fmtTime(dp).slice(0, 2), value: sum(sales.filter(x => x.dep === dp), x => x.revenue), color: 'var(--accent)' }))
+      : days.map(d => ({ label: dayLabel(d), value: sum(sales.filter(x => x.date === dayKey(d)), x => x.revenue), color: 'var(--accent)', showVal: repDays <= 7 }));
+    const loadItems = !sales ? [] : deps.map(dp => ({ label: fmtTime(dp).slice(0, 2), value: Math.round(sum(sales.filter(x => x.dep === dp), x => x.tickets) / days.length / seats * 100), color: 'var(--accent)' }));
+    const avgLoad = sales && tickets ? Math.round(tickets / (days.length * deps.length) / seats * 100) : 0;
+    const fareMix = !sales ? [] : ['Adult', 'Student', 'Senior', 'Child'].map(t => ({ label: t, value: sum(sales.filter(x => x.type === t), x => x.tickets), rev: sum(sales.filter(x => x.type === t), x => x.revenue), color: FARE_COLOR[t] })).filter(x => x.value);
+
+    // alerts (recorded)
+    const al = D.alerts || [];
+    const alTotal = sum(al, x => x.n), alCrit = sum(al.filter(x => x.severity === 'critical'), x => x.n), alOpen = sum(al.filter(x => x.status === 'open'), x => x.n);
+    const alTypes = Object.keys(ALERT_LABEL).map(t => ({ label: ALERT_LABEL[t], value: sum(al.filter(x => (ALERT_LABEL[x.type] ? x.type : 'other') === t), x => x.n), color: ALERT_COLOR[t] })).filter(x => x.value).sort((a, b) => b.value - a.value);
+
+    // maintenance (recorded; work orders are dated by due date)
+    const wos = S.workOrders.filter(w => w.due && w.due >= from && w.due <= to);
+    const done = wos.filter(w => w.status === 'done'); const spend = sum(done, w => +w.cost || 0);
+    const openNow = S.workOrders.filter(w => w.status !== 'done').length;
+    const woTypes = [...new Set(S.workOrders.map(w => w.type))].map(t => ({ label: t, value: sum(done.filter(w => w.type === t), w => +w.cost || 0), color: 'var(--warn)' })).filter(x => x.value).sort((a, b) => b.value - a.value);
+
+    const otp = otpModelled(days);
+    const otpItems = S.routes.filter(r => otp[r.id] != null).map(r => ({ label: `Line ${r.id}`, value: otp[r.id], color: r.color }));
+
+    const noSales = MODE === 'cloud' && !can('tickets');
+    const wait = D.loading ? empty('clock', 'Loading report data…') : D.error ? empty('alert', `Couldn’t load report data: ${esc(D.error)}. Check your connection, then reopen Reports.`) : '';
+    const salesBlock = (html, none) => noSales ? empty('shield', 'Ticket sales are visible to admins and dispatchers.') : wait || (tickets ? html : empty('ticket', none));
+
+    // CSV export
+    const csv = [
+      'date,boardings_modelled,coach_tickets,coach_revenue,alerts,critical_alerts,maintenance_spend',
+      ...days.map((d, i) => { const k = dayKey(d); const ds = sales ? sales.filter(x => x.date === k) : null; const da = al.filter(x => x.day === k);
+        return [k, pax[i], ds ? sum(ds, x => x.tickets) : '', ds ? sum(ds, x => x.revenue).toFixed(2) : '', sum(da, x => x.n), sum(da.filter(x => x.severity === 'critical'), x => x.n), sum(done.filter(w => w.due === k), w => +w.cost || 0).toFixed(2)].join(','); }),
+      '', 'line,on_time_pct_modelled', ...otpItems.map(x => `${x.label.replace('Line ', '')},${x.value}`),
+      ...(sales ? ['', 'fare_type,tickets,revenue', ...fareMix.map(x => `${x.label},${x.value},${x.rev.toFixed(2)}`)] : []),
+      '', 'alert_type,alerts', ...alTypes.map(x => `${x.label},${x.value}`),
+      '', 'job_type,completed_cost', ...woTypes.map(x => `${x.label},${x.value.toFixed(2)}`)
+    ].join('\n');
+
+    const ev = S.buses.filter(b => b.fuel === 'Electric').length;
+    el.innerHTML = `<div class="toolbar"><div class="seg" id="rp-seg">${REP_RANGES.map(([n, l]) => `<button data-n="${n}" class="${repDays === n ? 'on' : ''}">${l}</button>`).join('')}</div><span class="grow"></span>
+        <span class="muted" style="font-size:13px">${one ? days[0].toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }) : `${days[0].toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })} – ${days[days.length - 1].toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}`}</span></div>
+      <div class="big-stats">
+        <div class="big-stat"><div class="l">Boardings</div><div class="v">${fmtNum(paxTotal)}</div><div class="d">${one ? 'so far today' : `avg ${fmtNum(paxTotal / days.length)} per day`} · modelled</div></div>
+        <div class="big-stat"><div class="l">Coach ticket revenue</div><div class="v">${noSales || !sales ? '—' : moneyK(revenue)}</div><div class="d">${noSales ? 'Admins and dispatchers only' : !sales ? (D.error ? 'Couldn’t load' : 'Loading…') : `${fmtNum(tickets)} tickets · ${avgLoad}% of seats sold`}</div></div>
+        <div class="big-stat"><div class="l">Alerts raised</div><div class="v">${D.alerts ? fmtNum(alTotal) : '—'}</div><div class="d">${D.alerts ? `<span style="color:${alCrit ? 'var(--crit)' : 'inherit'}">${alCrit} critical</span> · ${alOpen} still open` : D.error ? 'Couldn’t load' : 'Loading…'}</div></div>
+        <div class="big-stat"><div class="l">Maintenance spend</div><div class="v">${moneyK(spend)}</div><div class="d">${done.length} job${done.length === 1 ? '' : 's'} completed · ${openNow} open now</div></div></div>
       <div class="rep-grid">
-        <div class="card"><div class="card-h"><h3>Daily boardings</h3><span class="sub">today is partial</span></div>${barChart({ items: days.map((d, i) => ({ label: d.toLocaleDateString('en-GB', { weekday: 'short' }), value: ride[i], color: i === 6 ? 'var(--accent)' : 'var(--info)', showVal: true })), h: 240, fmt: v => v >= 1000 ? (v / 1000).toFixed(v % 1000 ? 1 : 0) + 'k' : Math.round(v) })}</div>
-        <div class="card"><div class="card-h"><h3>Revenue by line</h3></div>${hbarChart({ items: byRoute, fmt: v => moneyK(v) })}</div>
-        <div class="card"><div class="card-h"><h3>On-time performance by line</h3><span class="sub">share of trips within 3 min</span></div>${hbarChart({ items: otp, max: 100, fmt: v => v + '%' })}</div>
-        <div class="card"><div class="card-h"><h3>Fleet energy mix</h3></div>${(() => { const mix = ['Electric', 'Diesel', 'CNG', 'Hydrogen'].map((f, i) => ({ label: f, value: S.buses.filter(b => b.fuel === f).length, color: ['var(--ok)', 'var(--muted)', 'var(--info)', 'var(--accent)'][i] })).filter(x => x.value); return `<div class="donut-wrap">${donut(mix, 160, (S.buses.length ? Math.round(ev / S.buses.length * 100) : 0) + '%', 'electric')}<div class="legend">${mix.map(i => `<span><span style="display:inline-flex;gap:6px;align-items:center"><i style="background:${i.color}"></i>${i.label}</span><b>${i.value}</b></span>`).join('')}</div></div>`; })()}</div>
+        <div class="card"><div class="card-h"><h3>${one ? 'Boardings by hour' : 'Daily boardings'}</h3><span class="sub">${one ? 'today so far' : 'today is partial'}</span>${modelled}</div>${barChart({ items: paxItems, h: 240, fmt: k1, every: one ? 2 : every })}</div>
+        <div class="card"><div class="card-h"><h3>Coach ticket revenue</h3><span class="sub">${coach ? `Line ${esc(coach.id)} · ${one ? 'by departure' : 'per day'}` : 'no coach line'}</span></div>${salesBlock(barChart({ items: revItems, h: 240, fmt: moneyAxis, every: one ? 2 : every }), 'No coach tickets sold in this period.')}</div>
+        <div class="card"><div class="card-h"><h3>Coach seats sold by departure</h3><span class="sub">average share of ${seats} seats${one ? ', today' : ' per day'}</span></div>${salesBlock(barChart({ items: loadItems, h: 220, fmt: v => Math.round(v) + '%', every: 2 }), 'No coach tickets sold in this period.')}</div>
+        <div class="card"><div class="card-h"><h3>Tickets by fare type</h3></div>${salesBlock(`<div class="donut-wrap">${donut(fareMix, 160, fmtNum(tickets), 'tickets')}<div class="legend">${fareMix.map(i => `<span><span style="display:inline-flex;gap:6px;align-items:center"><i style="background:${i.color}"></i>${i.label}</span><b style="white-space:nowrap">${fmtNum(i.value)} <span class="muted" style="font-weight:500">${moneyK(i.rev)}</span></b></span>`).join('')}</div></div>`, 'No coach tickets sold in this period.')}</div>
+        <div class="card"><div class="card-h"><h3>Alerts by type</h3><span class="sub">${D.alerts ? `${fmtNum(alTotal)} raised` : ''}</span></div>${wait || (alTypes.length ? hbarChart({ items: alTypes }) : empty('check', 'No alerts raised in this period.'))}</div>
+        <div class="card"><div class="card-h"><h3>Maintenance cost by job type</h3><span class="sub">completed work orders, by due date</span></div>${woTypes.length ? hbarChart({ items: woTypes, fmt: v => moneyK(v) }) : empty('wrench', 'No work orders completed in this period.')}</div>
+        <div class="card"><div class="card-h"><h3>On-time performance by line</h3><span class="sub">share of time within 3 min</span>${modelled}</div>${otpItems.length ? hbarChart({ items: otpItems, max: 100, fmt: v => v + '%' }) : empty('route', 'No buses are assigned to lines.')}</div>
+        <div class="card"><div class="card-h"><h3>Fleet energy mix</h3><span class="sub">current fleet</span></div>${(() => { const mix = ['Electric', 'Diesel', 'CNG', 'Hydrogen'].map((f, i) => ({ label: f, value: S.buses.filter(b => b.fuel === f).length, color: ['var(--ok)', 'var(--muted)', 'var(--info)', 'var(--accent)'][i] })).filter(x => x.value); return `<div class="donut-wrap">${donut(mix, 160, (S.buses.length ? Math.round(ev / S.buses.length * 100) : 0) + '%', 'electric')}<div class="legend">${mix.map(i => `<span><span style="display:inline-flex;gap:6px;align-items:center"><i style="background:${i.color}"></i>${i.label}</span><b>${i.value}</b></span>`).join('')}</div></div>`; })()}</div>
       </div>
-      <div class="card"><div class="card-h"><h3>Export</h3><span class="sub">CSV for spreadsheets or your BI tool</span><span class="spacer"></span><button class="btn" id="rp-copy">${icon('copy')}Copy CSV</button></div><pre class="mono" style="margin:0;max-height:160px;overflow:auto;background:var(--surface-2);padding:12px;border-radius:10px;user-select:all">${esc(csv)}</pre></div>`;
+      <p class="muted" style="font-size:13px;margin:0">Coach ticket sales, alerts and maintenance are your recorded data. Boardings and on-time performance come from the service model until a ticketing or GPS/AVL feed is connected.</p>
+      <div class="card"><div class="card-h"><h3>Export</h3><span class="sub">CSV for spreadsheets or your BI tool</span><span class="spacer"></span><button class="btn" id="rp-copy">${icon('copy')}Copy</button><button class="btn primary" id="rp-dl">${icon('download')}Download CSV</button></div><pre class="mono" style="margin:0;max-height:160px;overflow:auto;background:var(--surface-2);padding:12px;border-radius:10px;user-select:all">${esc(csv)}</pre></div>`;
+    $$('#rp-seg [data-n]', el).forEach(b => b.onclick = () => { repDays = +b.dataset.n; route(); });
     $('#rp-copy').onclick = () => copyText(csv, 'CSV copied to clipboard');
+    $('#rp-dl').onclick = () => downloadText(csv, `headway-report-${from}_${to}.csv`);
   }
 };
 

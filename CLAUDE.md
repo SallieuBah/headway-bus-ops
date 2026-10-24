@@ -34,6 +34,7 @@ Bus operations management web app: live fleet map, dispatch schedule, drivers, l
 - **Modes:** `MODE === 'local'` (demo, state in localStorage key `headway.v2`) or `'cloud'` (signed in). The sign-in page offers "Explore the demo without an account".
 - **Saving:** screens mutate `S` and call `save()`. In cloud mode `sync()` diffs each collection against the last server snapshot (`snap`) and sends inserts, per-row updates and deletes. The mapping between DB rows and app objects is the `TABLES` object (`to` / `from` per table). When adding a column or table, update `TABLES`, `loadCloud()` and the migration together.
 - **Realtime:** `subscribeCloud()` listens to `postgres_changes` on every table; `applyRemote()` merges changes into `S` and re-renders (skipped while a modal or input is focused).
+- **Reports:** ticket sales, alerts and maintenance are recorded data (cloud mode calls the report functions, cached for a minute; today's sales come from `S`). Boardings and on-time performance are modelled from `paxSoFar()` and `delayAt()`, and are labelled "Modelled" in the UI.
 - **Simulation:** bus positions, delays, load and energy are pure functions of the clock (`simulate()`), so every device shows the same picture without a server. Scripted incidents use a deterministic id per 150 s window (`sim-<n>`) and are inserted with ignore-duplicates. Replace `simulate()` with a real AVL/GPS feed to go live.
 - **Roles in the UI:** `role()`, `can(perm)`, `guard(perm)` and `PERMS` / `HIDDEN` control what each role sees and can click. The UI is convenience only; the database enforces the rules.
 
@@ -51,6 +52,7 @@ Roles live in `profiles.role`: `admin`, `dispatcher`, `mechanic`, `driver`, `vie
 | driver | Own shift (`profiles.driver_id`), raising alerts |
 | viewer | Read-only operations data (no bookings: passenger names) |
 
+- Report functions `public.report_ticket_sales(from_date, to_date)` and `public.report_alerts(from_ts, to_ts, tz)` return grouped totals for the Reports screen (no passenger names). They are `security invoker`, so the caller's RLS applies, and only `authenticated` may execute them.
 - Helper functions are in the **`private`** schema (not exposed by the API): `private.app_role()`, `private.my_driver_id()`, `private.handle_new_user()` (trigger on `auth.users` that creates the profile).
 - New sign-ups become `admin` only if their email is listed in `private.admin_emails`; everyone else starts as `viewer`. Admins change roles in the app under Preferences → Team & roles.
 - Policies use `(select private.app_role())` and one permissive policy per action (avoids the multiple-permissive-policies advisor warning).
