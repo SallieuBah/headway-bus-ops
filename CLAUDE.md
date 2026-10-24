@@ -14,6 +14,7 @@ Bus operations management web app: live fleet map, dispatch schedule, drivers, l
 - Fonts: Barlow Condensed (display), Barlow (body), JetBrains Mono (data/IDs).
 - Responsive: sidebar above 960px, bottom tab bar below. Respect safe-area insets.
 - Copy is plain and specific; errors say what went wrong and how to fix it.
+- **English only for now.** Don't add translations or a language switch unless the owner asks.
 
 ## Files
 
@@ -71,7 +72,6 @@ Push to `main`. GitHub Pages rebuilds in about a minute. Remember to bump `CACHE
 
 ## Ideas not built yet
 
-- Turkish/English language switch
 - Real GPS/AVL feed replacing the simulation
 - Capacitor build for App Store and Google Play
 - Custom SMTP in Supabase so teammates receive confirmation emails reliably
