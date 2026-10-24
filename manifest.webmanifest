@@ -1,0 +1,21 @@
+{
+  "name": "Headway Bus Operations",
+  "short_name": "Headway",
+  "description": "Live fleet map, dispatch, drivers, maintenance, ticketing and reports for bus operators.",
+  "start_url": "./index.html#dashboard",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f2231",
+  "theme_color": "#0f2231",
+  "categories": ["business", "productivity", "travel"],
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Live map", "url": "./index.html#map" },
+    { "name": "Alerts", "url": "./index.html#alerts" },
+    { "name": "Driver app", "url": "./index.html#driverapp" }
+  ]
+}
