@@ -1,6 +1,7 @@
 /* Headway — bus operations console.
    Vanilla JS, no build step: wraps cleanly into Capacitor / a PWA shell later.
-   Data lives in one state object (S) persisted to localStorage; swap `store` for an API to go live. */
+   Screens render from one state object (S). Signed in, S is loaded from Supabase, local edits are diffed and
+   written back, and realtime changes from other users are merged in. Demo mode keeps S in localStorage. */
 (() => {
 'use strict';
 
@@ -14,13 +15,18 @@ const pad = n => String(n).padStart(2, '0');
 const fmtTime = m => { m = ((Math.round(m) % 1440) + 1440) % 1440; return `${pad(Math.floor(m / 60))}:${pad(m % 60)}`; };
 const fmtNum = n => Math.round(n).toLocaleString('en-US');
 const uid = p => p + Math.random().toString(36).slice(2, 7).toUpperCase();
+const hashStr = s => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+const localDate = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
 function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const rand01 = key => rng(hashStr(key))();
+// smooth value noise in [0,1]; the same key and time give the same value on every device
+const noise = (key, x) => { const i = Math.floor(x), f = x - i, s = f * f * (3 - 2 * f); const a = rand01(key + ':' + i), b = rand01(key + ':' + (i + 1)); return a + (b - a) * s; };
 const niceMax = v => { if (v <= 0) return 1; const p = Math.pow(10, Math.floor(Math.log10(v))); const f = v / p; return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * p; };
 const money = n => `${S.settings.currency}${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const moneyK = n => n >= 10000 ? `${S.settings.currency}${(n / 1000).toFixed(1)}k` : money(n);
 
 const store = {
-  key: 'headway.v1',
+  key: 'headway.v2',
   load() { try { return JSON.parse(localStorage.getItem(this.key)); } catch (e) { return null; } },
   save(d) { try { localStorage.setItem(this.key, JSON.stringify(d)); } catch (e) { /* storage unavailable: keep running in memory */ } },
   clear() { try { localStorage.removeItem(this.key); } catch (e) {} }
@@ -66,7 +72,9 @@ const ICONS = {
   arrowL: '<path d="M19 12H5M11 6l-6 6 6 6"/>',
   door: '<path d="M5 21V4a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v17M3 21h18"/><circle cx="15" cy="12" r=".8"/>',
   user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
-  undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/>'
+  undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/>',
+  logout: '<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l-5-5 5-5M5 12h11"/>',
+  cloud: '<path d="M7 18a4.5 4.5 0 0 1-.5-9 6 6 0 0 1 11.5 1.5A3.75 3.75 0 0 1 17.5 18z"/>'
 };
 const icon = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n] || ''}</svg>`;
 
@@ -149,11 +157,10 @@ function seedState() {
   drivers.slice(d).forEach((dr, i) => { dr.status = i % 4 === 0 ? 'leave' : i % 2 === 0 ? 'standby' : 'off'; });
 
   const S0 = {
-    v: 1, routes, drivers, buses,
-    alerts: [], workOrders: [], bookings: [], messages: [], trips: [], cancelled: {},
+    v: 2, routes, drivers, buses,
+    alerts: [], workOrders: [], bookings: [], messages: [], tripOverrides: [], shifts: [],
     passengersToday: 0, revenueToday: 0,
-    settings: { operator: 'Meridian City Transit', currency: '€', speed: 1, paused: false },
-    checklist: {}, driverTrip: {}
+    settings: { id: 1, operator: 'Meridian City Transit', currency: '€', speed: 1 }
   };
 
   // alerts
@@ -186,27 +193,23 @@ function seedState() {
     const taken = Math.floor(R() * 30) + 6;
     const seats = new Set();
     while (seats.size < taken) seats.add(1 + Math.floor(R() * 44));
-    for (const seat of seats) S0.bookings.push({ id: uid('TK-'), dep, seat, name: pick(coachNames), type: R() > .8 ? 'Student' : 'Adult', fare: 9.5, issued: now - R() * 864e5 });
+    for (const seat of seats) S0.bookings.push({ id: uid('TK-'), date: localDate(), dep, seat, name: pick(coachNames), type: R() > .8 ? 'Student' : 'Adult', fare: 9.5, issued: now - R() * 864e5 });
   }
 
   // messages
   S0.messages.push({ id: uid('M'), to: 'D201', from: 'Dispatch', text: 'Detour on Market Hall: follow signed diversion via Hilltop.', time: now - 25 * 60000 });
 
-  // daily stats so far
-  const m = nowMin();
-  for (let h = 5; h < m / 60; h++) S0.passengersToday += demand(h) * Math.min(1, m / 60 - h);
-  S0.passengersToday = Math.round(S0.passengersToday);
-  S0.revenueToday = S0.passengersToday * 1.74;
   return S0;
 }
 function makeBus(n, [model, fuel, cap], status, routeId, driverId, R, frac) {
+  const energy = Math.round(40 + R() * 58);
   return {
+    energyBase: energy, holdUntil: 0,
     id: 'B-' + n, plate: `HW ${n} ${String.fromCharCode(65 + (n % 26))}${String.fromCharCode(65 + ((n * 7) % 26))}`,
     model, fuel, capacity: cap, year: 2016 + Math.floor(R() * 9), status, routeId, driverId,
     t: routeId ? clamp(frac + R() * .15, 0, 1) : 0, dir: R() > .5 ? 1 : -1, pace: .85 + R() * .3,
     speed: 0, occ: Math.round(cap * (.2 + R() * .6)), delay: Math.round(R() * 4 - 1),
-    energy: Math.round(40 + R() * 58), odo: Math.round(60000 + R() * 420000), nextService: Math.round(400 + R() * 9000),
-    trip: 'running', lowFlag: false
+    energy, odo: Math.round(60000 + R() * 420000), nextService: Math.round(400 + R() * 9000)
   };
 }
 
@@ -224,9 +227,223 @@ const inSimulatedHours = () => { const d = new Date(); const m = d.getHours() * 
 function coachDepartures() { const out = []; for (let m = 6 * 60; m <= 22 * 60; m += 60) out.push(m); return out; }
 
 // ---------------------------------------------------------------- state
-let S = store.load();
-if (!S || S.v !== 1) S = seedState();
-const save = () => store.save(S);
+let S = null;            // the working state every screen renders from
+let MODE = 'local';      // 'local' demo in this browser, or 'cloud' signed in to the team workspace
+let ME = null;           // signed-in profile: { id, email, full_name, role, driver_id }
+let LIVE = false;        // realtime channel connected
+const CFG = window.HEADWAY_CONFIG || null;
+const sb = CFG && window.supabase ? window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseKey) : null;
+
+// ---------------------------------------------------------------- roles
+const ROLE_LABEL = { admin: 'Admin', dispatcher: 'Dispatcher', mechanic: 'Mechanic', driver: 'Driver', viewer: 'Viewer' };
+const ROLE_HINT = {
+  admin: 'Everything, including lines, fleet records, settings and team roles',
+  dispatcher: 'Live operations: dispatch, schedule, alerts, drivers and ticket sales',
+  mechanic: 'Workshop: work orders and vehicle status',
+  driver: 'Their own shift in the driver app, and issue reports',
+  viewer: 'Read-only access to operations'
+};
+const role = () => MODE === 'cloud' ? (ME?.role || 'viewer') : 'admin';
+const PERMS = {
+  'fleet.add': ['admin'], 'fleet.edit': ['admin', 'dispatcher', 'mechanic'], 'routes.edit': ['admin'],
+  'drivers.add': ['admin'], 'drivers.edit': ['admin', 'dispatcher'], 'dispatch': ['admin', 'dispatcher'],
+  'tickets': ['admin', 'dispatcher'], 'maint': ['admin', 'dispatcher', 'mechanic'],
+  'alerts.raise': ['admin', 'dispatcher', 'mechanic', 'driver'], 'alerts.manage': ['admin', 'dispatcher'],
+  'settings': ['admin'], 'team': ['admin']
+};
+const can = p => PERMS[p].includes(role());
+function guard(p) {
+  if (can(p)) return true;
+  toast(`Your role (${ROLE_LABEL[role()]}) can't do this. Ask an admin for access.`, 'warn', 'shield');
+  return false;
+}
+const HIDDEN = { admin: [], dispatcher: [], mechanic: ['tickets', 'driverapp'], viewer: ['tickets', 'driverapp'], driver: ['dashboard', 'fleet', 'routes', 'drivers', 'maintenance', 'tickets', 'reports'] };
+const allowedView = k => !HIDDEN[role()].includes(k);
+const homeView = () => role() === 'driver' ? 'driverapp' : 'dashboard';
+
+// ---------------------------------------------------------------- cloud sync
+// Each table maps between database rows and the in-app objects. Local edits are found by diffing
+// against the last known server snapshot, so screens keep mutating S directly and call save().
+const isoT = t => new Date(t).toISOString();
+const TABLES = {
+  routes: {
+    coll: () => S.routes,
+    to: r => ({ id: r.id, name: r.name, color: r.color, stops: r.stops, headway: +r.headway, kind: r.kind, fare: +r.fare, seats: r.seats ?? null }),
+    from: x => ({ id: x.id, name: x.name, color: x.color, stops: x.stops, headway: x.headway, kind: x.kind, fare: +x.fare, seats: x.seats })
+  },
+  drivers: {
+    coll: () => S.drivers,
+    to: d => ({ id: d.id, name: d.name, phone: d.phone || null, status: d.status, bus_id: d.busId || null, hours_week: +d.hoursWeek || 0, rating: +d.rating, license_exp: d.licenseExp || null, since: d.since || null, color: d.color || null, km: Math.round(d.km || 0) }),
+    from: x => ({ id: x.id, name: x.name, phone: x.phone || '', status: x.status, busId: x.bus_id, hoursWeek: x.hours_week, rating: +x.rating, licenseExp: x.license_exp, since: x.since, color: x.color || AV_COLORS[0], km: x.km })
+  },
+  buses: {
+    coll: () => S.buses,
+    to: b => ({ id: b.id, plate: b.plate, model: b.model, fuel: b.fuel, capacity: +b.capacity, year: b.year || null, status: b.status, route_id: b.routeId || null, driver_id: b.driverId || null, energy: Math.round(b.energyBase * 10) / 10, odo: Math.round(b.odo), next_service: Math.round(b.nextService), pace: Math.round(b.pace * 1000) / 1000 }),
+    from: x => ({ id: x.id, plate: x.plate, model: x.model, fuel: x.fuel, capacity: x.capacity, year: x.year, status: x.status, routeId: x.route_id, driverId: x.driver_id, energyBase: +x.energy, odo: x.odo, nextService: x.next_service, pace: +x.pace })
+  },
+  alerts: {
+    coll: () => S.alerts,
+    to: a => ({ id: a.id, time: isoT(a.time), severity: a.severity, title: a.title, detail: a.detail || null, bus_id: a.busId || null, type: a.type || null, status: a.status }),
+    from: x => ({ id: x.id, time: Date.parse(x.time), severity: x.severity, title: x.title, detail: x.detail || '', busId: x.bus_id, type: x.type, status: x.status }),
+    ignoreDup: true // scripted incidents get the same id on every device; the first insert wins
+  },
+  work_orders: {
+    coll: () => S.workOrders,
+    to: w => ({ id: w.id, bus_id: w.busId, title: w.title, type: w.type, status: w.status, due: w.due || null, mechanic: w.mechanic || null, cost: +w.cost || 0 }),
+    from: x => ({ id: x.id, busId: x.bus_id, title: x.title, type: x.type, status: x.status, due: x.due, mechanic: x.mechanic || '', cost: +x.cost })
+  },
+  bookings: {
+    coll: () => S.bookings,
+    to: b => ({ id: b.id, dep_date: b.date || localDate(), dep: b.dep, seat: b.seat, name: b.name, type: b.type, fare: +b.fare, issued: isoT(b.issued) }),
+    from: x => ({ id: x.id, date: x.dep_date, dep: x.dep, seat: x.seat, name: x.name, type: x.type, fare: +x.fare, issued: Date.parse(x.issued) }),
+    rowFilter: x => x.dep_date === localDate()
+  },
+  messages: {
+    coll: () => S.messages,
+    to: m => ({ id: m.id, to_driver: m.to, sender: m.from, text: m.text, time: isoT(m.time) }),
+    from: x => ({ id: x.id, to: x.to_driver, from: x.sender, text: x.text, time: Date.parse(x.time) })
+  },
+  trip_overrides: {
+    coll: () => S.tripOverrides, conflict: 'trip_date,trip_id',
+    to: o => ({ trip_date: localDate(), trip_id: o.id, driver_id: o.driverId || null, cancelled: !!o.cancelled }),
+    from: x => ({ id: x.trip_id, driverId: x.driver_id, cancelled: x.cancelled }),
+    keyRow: x => x.trip_id, match: k => ({ trip_date: localDate(), trip_id: k }), rowFilter: x => x.trip_date === localDate()
+  },
+  driver_shifts: {
+    coll: () => S.shifts,
+    to: s => ({ shift_date: localDate(), driver_id: s.id, checklist: s.checklist || {}, on_trip: s.onTrip !== false }),
+    from: x => ({ id: x.driver_id, checklist: x.checklist || {}, onTrip: x.on_trip }),
+    keyRow: x => x.driver_id, match: k => ({ shift_date: localDate(), driver_id: k }), rowFilter: x => x.shift_date === localDate()
+  },
+  settings: {
+    coll: () => [S.settings],
+    to: s => ({ id: 1, operator: s.operator, currency: s.currency, speed: +s.speed || 1 }),
+    from: x => ({ id: 1, operator: x.operator, currency: x.currency, speed: +x.speed })
+  }
+};
+const keyRowOf = (def, x) => def.keyRow ? def.keyRow(x) : x.id;
+const matchOf = (def, k) => def.match ? def.match(k) : { id: k };
+const busLive = b => Object.assign(b, { t: b.t ?? 0, dir: b.dir ?? 1, speed: 0, occ: b.occ ?? 0, delay: b.delay ?? 0, energy: b.energy ?? b.energyBase, holdUntil: b.holdUntil || 0 });
+
+let snap = {};
+function snapshotAll() { snap = {}; for (const [t, def] of Object.entries(TABLES)) snap[t] = new Map(def.coll().map(o => [o.id, JSON.stringify(def.to(o))])); }
+
+async function loadCloud() {
+  const d = localDate();
+  const q = t => sb.from(t).select('*');
+  const res = await Promise.all([
+    q('routes').order('id'), q('drivers').order('id'), q('buses').order('id'),
+    q('alerts').order('time', { ascending: false }).limit(200), q('work_orders').order('id'),
+    q('bookings').eq('dep_date', d), q('messages').order('time', { ascending: false }).limit(100),
+    q('trip_overrides').eq('trip_date', d), q('driver_shifts').eq('shift_date', d), q('settings').eq('id', 1)
+  ]);
+  const bad = res.find(r => r.error); if (bad) throw bad.error;
+  const [routes, drivers, buses, alerts, wos, bookings, messages, ovr, shifts, settings] = res.map(r => r.data);
+  const T = TABLES;
+  S = {
+    v: 2, routes: routes.map(T.routes.from), drivers: drivers.map(T.drivers.from), buses: buses.map(x => busLive(T.buses.from(x))),
+    alerts: alerts.map(T.alerts.from), workOrders: wos.map(T.work_orders.from), bookings: bookings.map(T.bookings.from),
+    messages: messages.map(T.messages.from), tripOverrides: ovr.map(T.trip_overrides.from), shifts: shifts.map(T.driver_shifts.from),
+    settings: settings[0] ? T.settings.from(settings[0]) : { id: 1, operator: 'Transit operator', currency: '€', speed: 1 },
+    passengersToday: 0, revenueToday: 0
+  };
+  TRIPS = buildTrips(); snapshotAll(); simulate();
+}
+
+let syncing = false, syncAgain = false, syncTimer = null;
+function save() {
+  if (!S) return;
+  if (MODE === 'cloud') { clearTimeout(syncTimer); syncTimer = setTimeout(sync, 250); }
+  else store.save(S);
+}
+async function sync() {
+  if (MODE !== 'cloud' || !S) return;
+  if (syncing) { syncAgain = true; return; }
+  syncing = true;
+  try {
+    for (const [t, def] of Object.entries(TABLES)) {
+      const prev = snap[t] || new Map(); const cur = new Map();
+      for (const o of def.coll()) cur.set(o.id, def.to(o));
+      const added = [], changed = [], removed = [];
+      for (const [k, row] of cur) { const j = JSON.stringify(row); if (!prev.has(k)) added.push(row); else if (prev.get(k) !== j) changed.push([k, row]); }
+      for (const k of prev.keys()) if (!cur.has(k)) removed.push(k);
+      if (!added.length && !changed.length && !removed.length) continue;
+      snap[t] = new Map([...cur].map(([k, r]) => [k, JSON.stringify(r)]));
+      if (added.length) {
+        const { error } = def.ignoreDup ? await sb.from(t).upsert(added, { onConflict: def.conflict || 'id', ignoreDuplicates: true }) : await sb.from(t).insert(added);
+        if (error) throw Object.assign(error, { table: t });
+      }
+      for (const [k, row] of changed) { const { error } = await sb.from(t).update(row).match(matchOf(def, k)); if (error) throw Object.assign(error, { table: t }); }
+      for (const k of removed) { const { error } = await sb.from(t).delete().match(matchOf(def, k)); if (error) throw Object.assign(error, { table: t }); }
+    }
+  } catch (e) {
+    console.error('sync failed', e);
+    const msg = e.code === '23505' && e.table === 'bookings' ? 'That seat was just sold on another screen. Pick another seat.'
+      : e.code === '42501' || /row-level security/i.test(e.message || '') ? `Your role (${ROLE_LABEL[role()]}) can't make that change, so it was undone.`
+      : `Couldn't save your change: ${e.message || 'network error'}. Showing the latest saved data.`;
+    toast(msg, 'crit', 'alert');
+    try { await loadCloud(); } catch (_) {}
+    rerender(true);
+  } finally {
+    syncing = false;
+    if (syncAgain) { syncAgain = false; sync(); }
+  }
+}
+
+let channel = null;
+function subscribeCloud() {
+  if (channel) sb.removeChannel(channel);
+  channel = sb.channel('headway-live');
+  for (const t of Object.keys(TABLES)) channel.on('postgres_changes', { event: '*', schema: 'public', table: t }, p => applyRemote(t, p));
+  channel.on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, onProfileChange);
+  channel.subscribe(status => { LIVE = status === 'SUBSCRIBED'; updateChrome(); });
+}
+function applyRemote(t, p) {
+  if (!S) return;
+  const def = TABLES[t]; const del = p.eventType === 'DELETE'; const row = del ? p.old : p.new;
+  if (!del && def.rowFilter && !def.rowFilter(row)) return;
+  const k = keyRowOf(def, row); const list = def.coll(); const i = list.findIndex(o => o.id === k);
+  if (del) {
+    if (i < 0) return;
+    if (t !== 'settings') list.splice(i, 1);
+    snap[t].delete(k);
+  } else {
+    const obj = def.from(row);
+    if (i >= 0) Object.assign(list[i], obj);
+    else if (t === 'alerts') {
+      list.unshift(obj); list.sort((a, b) => b.time - a.time);
+      if (Date.now() - obj.time < 180000) toast(`${obj.title}${obj.busId ? ' · ' + obj.busId : ''}`, obj.severity === 'critical' ? 'crit' : obj.severity === 'warning' ? 'warn' : 'info', 'alert');
+    } else list.push(t === 'buses' ? busLive(obj) : obj);
+    snap[t].set(k, JSON.stringify(def.to(i >= 0 ? list[i] : obj)));
+  }
+  if (['buses', 'routes', 'drivers', 'trip_overrides'].includes(t)) TRIPS = buildTrips();
+  simulate(); rerender();
+}
+async function onProfileChange(p) {
+  if (!ME || !p.new) return;
+  if (p.new.id === ME.id) {
+    const changed = p.new.role !== ME.role || p.new.driver_id !== ME.driver_id;
+    ME = { ...ME, ...p.new };
+    if (changed) {
+      toast(`Your access changed: you are now ${ROLE_LABEL[ME.role]}.`, 'info', 'shield');
+      try { await loadCloud(); } catch (_) {}
+      shell(); route();
+    }
+  } else if (current === VIEWS.preferences) VIEWS.preferences.team();
+}
+// re-render the open screen after remote changes, without disturbing someone mid-edit
+let rrTimer = null;
+function rerender(now) {
+  clearTimeout(rrTimer);
+  rrTimer = setTimeout(() => {
+    if (!current || !S) return;
+    updateChrome();
+    if (!now && ($('#overlay').children.length || document.activeElement?.matches?.('input, textarea, select'))) return;
+    if (current === VIEWS.map) { current.list(); current.drawer(); return; }
+    const y = window.scrollY; route(true); window.scrollTo(0, y);
+  }, now ? 0 : 400);
+}
+
 const bus = id => S.buses.find(b => b.id === id);
 const driver = id => S.drivers.find(d => d.id === id);
 const routeOf = id => S.routes.find(r => r.id === id);
@@ -276,66 +493,71 @@ function buildTrips() {
     while (t + dur < 1395) {
       const drv = t < 840 ? b.driverId : (relief ? relief.id : b.driverId);
       const id = `${b.id}-${n}`;
-      trips.push({ id, busId: b.id, routeId: r.id, driverId: drv, start: t, end: t + dur, dir, n });
+      trips.push({ id, busId: b.id, routeId: r.id, driverId: ovr(id)?.driverId || drv, start: t, end: t + dur, dir, n });
       t += dur + lay; dir *= -1; n++;
     }
   });
   return trips;
 }
-let TRIPS = buildTrips();
+let TRIPS = [];
+// dispatcher changes to today's timetable: driver swaps and cancellations
+const ovr = id => S.tripOverrides.find(o => o.id === id);
+const isCancelled = id => !!ovr(id)?.cancelled;
+function setOvr(id, patch) { let o = ovr(id); if (!o) { o = { id, driverId: null, cancelled: false }; S.tripOverrides.push(o); } Object.assign(o, patch); }
+const shiftOf = id => S.shifts.find(s => s.id === id);
+function setShift(id, patch) { let s = shiftOf(id); if (!s) { s = { id, checklist: {}, onTrip: true }; S.shifts.push(s); } Object.assign(s, patch); }
 function tripState(tr, m = nowMin()) {
-  if (S.cancelled[tr.id]) return 'cancelled';
+  if (isCancelled(tr.id)) return 'cancelled';
   if (tr.end < m) return 'done';
   if (tr.start <= m) return 'running';
   return 'planned';
 }
 
 // ---------------------------------------------------------------- simulation
-let lastTick = performance.now();
+// Movement is a pure function of the clock, so every signed-in screen shows each bus in the same place
+// without a server pushing positions. Replace this block with your AVL/GPS feed to go live.
 const ALERT_TYPES = [
-  b => ({ severity: 'warning', title: `Line ${b.routeId} running late`, detail: `${b.id} is ${b.delay} min behind schedule near ${nextStops(b, 1)[0]?.stop.name || 'terminus'}.`, type: 'delay', when: b.delay >= 6 }),
-  b => ({ severity: 'warning', title: 'Crowding reported', detail: `${b.id} at ${Math.round(b.occ / b.capacity * 100)}% load. Consider a short-turn extra.`, type: 'crowd', when: b.occ / b.capacity > .92 }),
-  b => ({ severity: 'critical', title: 'Engine warning light', detail: `${b.id} reports coolant temperature high. Driver asked to pull over safely.`, type: 'fault', when: Math.random() < .25 }),
-  b => ({ severity: 'info', title: 'Passenger assistance request', detail: `Wheelchair ramp requested on ${b.id} at ${nextStops(b, 1)[0]?.stop.name || 'next stop'}.`, type: 'ops', when: true }),
-  b => ({ severity: 'warning', title: 'Harsh braking event', detail: `Telematics logged 0.48 g deceleration on ${b.id}.`, type: 'safety', when: Math.random() < .5 })
+  b => b.delay >= 5 && { severity: 'warning', title: `Line ${b.routeId} running late`, detail: `${b.id} is ${b.delay} min behind schedule near ${nextStops(b, 1)[0]?.stop.name || 'terminus'}.`, type: 'delay' },
+  b => b.occ / b.capacity > .8 && { severity: 'warning', title: 'Crowding reported', detail: `${b.id} at ${Math.round(b.occ / b.capacity * 100)}% load. Consider a short-turn extra.`, type: 'crowd' },
+  b => ({ severity: 'critical', title: 'Engine warning light', detail: `${b.id} reports coolant temperature high. Driver asked to pull over safely.`, type: 'fault' }),
+  b => ({ severity: 'info', title: 'Passenger assistance request', detail: `Wheelchair ramp requested on ${b.id} at ${nextStops(b, 1)[0]?.stop.name || 'next stop'}.`, type: 'ops' }),
+  b => ({ severity: 'warning', title: 'Harsh braking event', detail: `Telematics logged 0.48 g deceleration on ${b.id}.`, type: 'safety' })
 ];
 function raiseAlert(a) {
-  const al = { id: uid('A-'), time: Date.now(), status: 'open', ...a };
+  if (a.id && S.alerts.some(x => x.id === a.id)) return;
+  if (MODE === 'cloud' && !can('alerts.raise')) return;
+  const al = { status: 'open', ...a, id: a.id || uid('A-'), time: a.time || Date.now() };
   S.alerts.unshift(al);
-  if (S.alerts.length > 80) S.alerts.length = 80;
+  if (MODE === 'local' && S.alerts.length > 120) S.alerts.length = 120;
   toast(`${a.title}${a.busId ? ' · ' + a.busId : ''}`, a.severity === 'critical' ? 'crit' : a.severity === 'warning' ? 'warn' : 'info', 'alert');
-  updateChrome();
+  updateChrome(); save();
 }
+function paxSoFar(m = nowMin()) { let p = 0; for (let x = 330; x < m; x += 5) p += demand(x / 60) * Math.min(5, m - x) / 60; return Math.round(p); }
 function simulate() {
-  const nowP = performance.now();
-  const dt = Math.min(5, (nowP - lastTick) / 1000) * (S.settings.paused ? 0 : S.settings.speed);
-  lastTick = nowP;
-  if (!dt) return;
-  const hour = nowMin() / 60;
+  if (!S) return;
+  const now = Date.now() / 1000; const sp = +S.settings.speed || 1; const hour = nowMin() / 60;
   for (const b of S.buses) {
     if (b.status !== 'service' || !b.routeId) { b.speed = 0; continue; }
     const r = routeOf(b.routeId); if (!r) continue;
     const g = geom(r);
-    // dwell near stops
+    const x = now * sp * b.pace / 360 + rand01(b.id) * 2;
+    const m = x % 2; b.t = m < 1 ? m : 2 - m; b.dir = m < 1 ? 1 : -1;
     const nearStop = g.stopT.some(t => Math.abs(t - b.t) < .006);
-    const target = nearStop ? 0 : clamp(18 + 26 * b.pace - (b.delay > 4 ? 6 : 0) + rnd(-6, 6), 8, 62);
-    b.speed = Math.round(b.speed + (target - b.speed) * .35);
-    b.t += b.dir * (g.total / (360 / b.pace)) * dt / g.total * (nearStop ? .35 : 1);
-    if (b.t >= 1) { b.t = 1; b.dir = -1; b.delay = Math.max(-1, b.delay - 2); }
-    if (b.t <= 0) { b.t = 0; b.dir = 1; b.delay = Math.max(-1, b.delay - 2); }
-    if (Math.random() < .03 * dt) b.delay = clamp(b.delay + (Math.random() < .55 ? 1 : -1), -2, 12);
-    if (nearStop && Math.random() < .3) b.occ = clamp(Math.round(b.occ + rnd(-8, 9) * (demand(hour) / 1200)), 2, Math.round(b.capacity * 1.02));
-    b.energy = clamp(b.energy - .012 * dt, 4, 100);
-    b.odo += b.speed / 3600 * dt * 6;
-    if (b.energy < 15 && !b.lowFlag) { b.lowFlag = true; raiseAlert({ severity: 'warning', title: b.fuel === 'Electric' ? 'Low battery' : 'Low fuel', detail: `${b.id} at ${Math.round(b.energy)}%. Plan a swap at the next layover.`, busId: b.id, type: 'energy' }); }
+    b.speed = nearStop ? 0 : Math.round(16 + 38 * noise(b.id + 's', now / 25));
+    b.delay = Math.round(-1.5 + 12 * noise(b.id + 'd', now / 300) ** 2) + (b.holdUntil > Date.now() ? 2 : 0);
+    b.occ = Math.round(b.capacity * clamp(.1 + .8 * noise(b.id + 'o', now / 120) * (.35 + demand(hour) / 1700), .03, 1.02));
+    b.energy = clamp(b.energyBase - Math.max(0, hour - 5.5) * (b.fuel === 'Electric' ? 3.4 : 2.4), 4, 100);
+    if (b.energy < 15) raiseAlert({ id: `low-${b.id}-${localDate()}`, severity: 'warning', title: b.fuel === 'Electric' ? 'Low battery' : 'Low fuel', detail: `${b.id} at ${Math.round(b.energy)}%. Plan a swap at the next layover.`, busId: b.id, type: 'energy' });
   }
-  const boarded = demand(hour) / 3600 * dt * 6;
-  S.passengersToday += boarded;
-  S.revenueToday += boarded * 1.74;
-  if (Math.random() < .018 * dt) {
-    const active = S.buses.filter(b => b.status === 'service');
-    const b = active[Math.floor(Math.random() * active.length)];
-    if (b) { const gen = ALERT_TYPES[Math.floor(Math.random() * ALERT_TYPES.length)](b); if (gen.when) { delete gen.when; raiseAlert({ ...gen, busId: b.id }); } }
+  S.passengersToday = paxSoFar();
+  S.revenueToday = S.passengersToday * 1.74 + S.bookings.reduce((a, bk) => a + (+bk.fare || 0), 0);
+  // scripted incidents: one decision per 150-second window, identical on every device and stored once
+  const win = Math.floor(Date.now() / 150000); const key = `sim-${win}`;
+  if (rand01(key) < .4) {
+    const active = S.buses.filter(b => b.status === 'service').sort((a, b) => a.id < b.id ? -1 : 1);
+    const b = active[Math.floor(rand01(key + 'b') * active.length)];
+    const gen = b && ALERT_TYPES[Math.floor(rand01(key + 't') * ALERT_TYPES.length)](b);
+    if (gen) raiseAlert({ ...gen, id: key, busId: b.id, time: win * 150000 });
   }
 }
 
@@ -565,8 +787,8 @@ VIEWS.dashboard = {
         <div><h2>${hr}, Dispatch</h2><p>${esc(S.settings.operator)} · ${new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })} · <span id="d-run">${k.active} buses on the road</span></p></div>
         <div class="spacer"></div>
         <div class="toolbar">
-          <button class="btn" data-go="tickets">${icon('ticket')}Sell coach seat</button>
-          <button class="btn" id="d-incident">${icon('alert')}Log incident</button>
+          ${can('tickets') ? `<button class="btn" data-go="tickets">${icon('ticket')}Sell coach seat</button>` : ''}
+          ${can('alerts.raise') ? `<button class="btn" id="d-incident">${icon('alert')}Log incident</button>` : ''}
           <button class="btn primary" data-go="map">${icon('map')}Open live map</button>
         </div>
       </div>
@@ -583,7 +805,7 @@ VIEWS.dashboard = {
         <div class="card"><div class="card-h"><h3>Open alerts</h3><span class="spacer"></span><button class="btn sm ghost" data-go="alerts">All alerts ${icon('arrowR')}</button></div><div class="feed" id="d-feed"></div></div>
         <div class="card"><div class="card-h"><h3>Needs attention</h3></div><div class="feed" id="d-attn"></div></div>
       </div>`;
-    $('#d-incident').onclick = () => incidentModal();
+    if ($('#d-incident')) $('#d-incident').onclick = () => incidentModal();
     this.tick(true);
   },
   tick(full) {
@@ -591,7 +813,7 @@ VIEWS.dashboard = {
     const paxSeries = Array.from({ length: 12 }, (_, i) => demand(Math.max(5, h - 11 + i)));
     $('#d-run').textContent = `${k.active} buses on the road`;
     $('#d-kpis').innerHTML = [
-      { go: 'fleet', l: 'Buses in service', ic: 'bus', v: `${k.active}<small>/${k.fleet}</small>`, f: `${Math.round(k.active / k.fleet * 100)}% fleet availability`, s: spark([12, 14, 15, 16, 17, 17, 16, 17, k.active], 'var(--info)') },
+      { go: 'fleet', l: 'Buses in service', ic: 'bus', v: `${k.active}<small>/${k.fleet}</small>`, f: `${k.fleet ? Math.round(k.active / k.fleet * 100) : 0}% fleet availability`, s: spark([12, 14, 15, 16, 17, 17, 16, 17, k.active], 'var(--info)') },
       { go: 'map', l: 'On-time performance', ic: 'clock', v: `${k.otp}<small>%</small>`, f: `<span class="${k.otp >= 85 ? 'up' : 'down'}">${k.otp >= 85 ? '▲' : '▼'}</span> target 85%`, s: spark([88, 91, 86, 84, 89, 92, 90, 87, k.otp], k.otp >= 85 ? 'var(--ok)' : 'var(--crit)') },
       { go: 'reports', l: 'Passengers today', ic: 'users', v: fmtNum(k.pax), f: `<span class="up">▲ 4.2%</span> vs last ${new Date().toLocaleDateString('en-GB', { weekday: 'short' })}`, s: spark(paxSeries, 'var(--accent)') },
       { go: 'reports', l: 'Fare revenue', ic: 'ticket', v: moneyK(k.rev), f: `avg load ${k.load}%`, s: spark(paxSeries.map(v => v * 1.74), 'var(--ok)') },
@@ -601,7 +823,7 @@ VIEWS.dashboard = {
     $('#d-clock').innerHTML = `${fmtTime(m)}<span class="blink">:</span>${pad(new Date().getSeconds())}`;
     // departure board
     const rows = S.routes.map(r => {
-      const next = TRIPS.filter(t => t.routeId === r.id && t.start >= m && !S.cancelled[t.id]).sort((a, b) => a.start - b.start)[0];
+      const next = TRIPS.filter(t => t.routeId === r.id && t.start >= m && !isCancelled(t.id)).sort((a, b) => a.start - b.start)[0];
       if (!next) return '';
       const b = bus(next.busId); const due = Math.round(next.start - m); const late = b && b.delay > 3;
       const from = STOP[next.dir > 0 ? r.stops[0] : r.stops[r.stops.length - 1]].name;
@@ -696,11 +918,16 @@ VIEWS.map = {
       </div>
       <div><div class="eyebrow" style="margin-bottom:6px">Next stops</div><div class="next-stops">${nextStops(b, 4).map(n => `<div>${esc(n.stop.name)}<time>${n.eta} min</time></div>`).join('') || '<div>Terminus</div>'}</div></div>
       <dl class="kv"><dt>Driver</dt><dd>${esc(d?.name || 'Unassigned')}</dd><dt>Vehicle</dt><dd>${esc(b.model)}</dd><dt>Plate</dt><dd class="mono">${esc(b.plate)}</dd><dt>Passengers</dt><dd>${b.occ} / ${b.capacity}</dd></dl>
-      <div class="toolbar"><button class="btn sm" id="dr-msg">${icon('message')}Message driver</button><button class="btn sm" id="dr-hold">${icon('clock')}Hold 2 min</button><button class="btn sm danger" id="dr-pull">${icon('undo')}Pull in</button></div>
+      ${can('dispatch') ? `<div class="toolbar"><button class="btn sm" id="dr-msg">${icon('message')}Message driver</button><button class="btn sm" id="dr-hold">${icon('clock')}Hold 2 min</button><button class="btn sm danger" id="dr-pull">${icon('undo')}Pull in</button></div>` : ''}
     </div>`;
     $('#dr-x').onclick = () => { mapSel = null; box.innerHTML = ''; this.list(); updateMapBuses($('#bigmap'), null); };
+    if (!can('dispatch')) return;
     $('#dr-msg').onclick = () => messageModal(b);
-    $('#dr-hold').onclick = () => { b.delay += 2; toast(`${b.id} told to hold 2 min for headway balancing`, 'ok', 'clock'); save(); };
+    $('#dr-hold').onclick = () => {
+      b.holdUntil = Date.now() + 120000;
+      if (b.driverId) S.messages.unshift({ id: uid('M'), to: b.driverId, from: 'Dispatch', text: 'Hold at the next stop for 2 min for headway balancing.', time: Date.now() });
+      save(); toast(`${b.id} told to hold 2 min for headway balancing`, 'ok', 'clock');
+    };
     $('#dr-pull').onclick = () => openModal({
       title: `Pull ${b.id} out of service?`, body: `<p>The bus returns to the depot and its remaining trips today need cover. ${esc(d?.name || 'The driver')} goes to standby.</p>`,
       actions: [{ label: 'Keep in service' }, { label: 'Pull in to depot', kind: 'primary', onClick: () => { b.status = 'depot'; if (d) { d.status = 'standby'; } toast(`${b.id} sent to depot`, 'warn', 'undo'); mapSel = null; save(); route(); } }]
@@ -724,7 +951,7 @@ VIEWS.fleet = {
     $('#f-seg').onclick = e => { const b = e.target.closest('[data-s]'); if (b) { fleetFilter = b.dataset.s; this.render(el); } };
     $$('[data-v]', el).forEach(b => b.onclick = () => { fleetView = b.dataset.v; this.render(el); });
     $('#f-q').oninput = () => this.draw();
-    $('#f-add').onclick = () => busModal();
+    $('#f-add').onclick = () => { if (guard('fleet.add')) busModal(); };
     this.draw();
   },
   draw() {
@@ -753,13 +980,13 @@ VIEWS.fleet = {
 };
 function busModal(b) {
   const isNew = !b;
-  b = b || { id: 'B-' + (Math.max(...S.buses.map(x => +x.id.slice(2))) + 1), plate: '', model: 'Mercedes-Benz eCitaro', fuel: 'Electric', capacity: 88, year: new Date().getFullYear(), status: 'depot', routeId: '', driverId: '' };
+  b = b || { id: 'B-' + (Math.max(100, ...S.buses.map(x => +x.id.slice(2) || 0)) + 1), plate: '', model: 'Mercedes-Benz eCitaro', fuel: 'Electric', capacity: 88, year: new Date().getFullYear(), status: 'depot', routeId: '', driverId: '' };
   const freeDrivers = S.drivers.filter(d => !d.busId || d.busId === b.id);
   openModal({
     title: isNew ? 'Add bus' : `${b.id} · ${esc(b.model)}`, wide: !isNew,
     body: `${!isNew ? `<div class="stat-grid" style="grid-template-columns:repeat(4,1fr)"><div class="stat"><div class="s-l">Odometer</div><div class="s-v">${fmtNum(b.odo)}</div></div><div class="stat"><div class="s-l">Energy</div><div class="s-v">${Math.round(b.energy)}%</div></div><div class="stat"><div class="s-l">Next service</div><div class="s-v">${fmtNum(b.nextService)}</div></div><div class="stat"><div class="s-l">Built</div><div class="s-v">${b.year}</div></div></div>` : ''}
       <div class="form-grid">
-        ${field({ id: 'id', label: 'Fleet number', value: b.id })}
+        ${isNew ? field({ id: 'id', label: 'Fleet number', value: b.id }) : ''}
         ${field({ id: 'plate', label: 'Licence plate', value: b.plate, placeholder: 'HW 125 XY' })}
         ${field({ id: 'model', label: 'Model', value: b.model })}
         ${field({ id: 'fuel', label: 'Propulsion', type: 'select', value: b.fuel, options: ['Electric', 'Diesel', 'CNG', 'Hydrogen'].map(x => [x, x]) })}
@@ -769,14 +996,17 @@ function busModal(b) {
         ${field({ id: 'driverId', label: 'Driver', type: 'select', value: b.driverId || '', options: [['', 'Unassigned'], ...freeDrivers.map(d => [d.id, `${d.name} (${DSTATUS[d.status].label})`])] })}
       </div>`,
     actions: [
-      ...(!isNew ? [{ label: 'Create work order', icon: 'wrench', onClick: () => { setTimeout(() => woModal({ busId: b.id }), 0); } }] : []),
+      ...(!isNew && can('maint') ? [{ label: 'Create work order', icon: 'wrench', onClick: () => { setTimeout(() => woModal({ busId: b.id }), 0); } }] : []),
       { label: 'Cancel' },
       {
         label: isNew ? 'Add bus' : 'Save changes', kind: 'primary', onClick: m => {
-          if (!requireFields(m, ['id', 'plate', 'model'])) return false;
+          if (!guard(isNew ? 'fleet.add' : 'fleet.edit')) return false;
+          if (!requireFields(m, isNew ? ['id', 'plate', 'model'] : ['plate', 'model'])) return false;
           const f = readForm(m);
+          if (!isNew) f.id = b.id; // the fleet number is the record key
           if (isNew && S.buses.some(x => x.id === f.id)) { toast(`${f.id} already exists. Pick another fleet number.`, 'warn', 'alert'); return false; }
           if (f.status === 'service' && (!f.routeId || !f.driverId)) { toast('A bus in service needs a line and a driver.', 'warn', 'alert'); return false; }
+          if ((f.driverId || null) !== (b.driverId || null) && !can('drivers.edit')) { toast('Only dispatch can change who drives a bus.', 'warn', 'shield'); return false; }
           const target = isNew ? makeBus(+f.id.replace(/\D/g, '') || 199, [f.model, f.fuel, +f.capacity], f.status, null, null, Math.random, 0) : b;
           const oldDriver = driver(target.driverId);
           if (oldDriver && oldDriver.id !== f.driverId) { oldDriver.busId = null; if (oldDriver.status === 'duty') oldDriver.status = 'standby'; }
@@ -808,8 +1038,8 @@ VIEWS.routes = {
             ${r.stops.map((sid, i) => `<span class="st" style="left:${g.stopT[i] * 100}%;border-color:${r.color}"></span><span class="st-l ${i % 2 ? 'alt' : ''}" style="left:${g.stopT[i] * 100}%">${esc(STOP[sid].name)}</span>`).join('')}
             <div class="bdots"></div></div></div></div>`;
       }).join('')}</div>`;
-    $('#r-add').onclick = () => routeModal();
-    $$('[data-edit]', el).forEach(b => b.onclick = () => routeModal(routeOf(b.dataset.edit)));
+    $('#r-add').onclick = () => { if (guard('routes.edit')) routeModal(); };
+    $$('[data-edit]', el).forEach(b => b.onclick = () => { if (guard('routes.edit')) routeModal(routeOf(b.dataset.edit)); });
     this.tick();
   },
   tick() {
@@ -826,7 +1056,7 @@ function routeModal(r) {
   openModal({
     title: isNew ? 'New line' : `Edit line ${r.id}`, wide: true,
     body: `<div class="form-grid">
-      ${field({ id: 'id', label: 'Line number', value: r?.id || '', placeholder: 'e.g. 62' })}
+      ${isNew ? field({ id: 'id', label: 'Line number', value: '', placeholder: 'e.g. 62' }) : ''}
       ${field({ id: 'name', label: 'Line name', value: r?.name || '', placeholder: 'Harbor Terminal – Airport' })}
       ${field({ id: 'headway', label: 'Headway (minutes)', type: 'number', value: r?.headway || 12, min: 3, max: 120 })}
       ${field({ id: 'fare', label: `Fare (${S.settings.currency})`, type: 'number', value: r?.fare || 1.8, step: .1, min: 0 })}
@@ -840,9 +1070,10 @@ function routeModal(r) {
       { label: 'Cancel' },
       {
         label: isNew ? 'Create line' : 'Save line', kind: 'primary', onClick: m => {
-          if (!requireFields(m, ['id', 'name'])) return false;
+          if (!requireFields(m, isNew ? ['id', 'name'] : ['name'])) return false;
           if (sel.length < 2) { toast('Pick at least two stops for the line.', 'warn', 'alert'); return false; }
           const f = readForm(m);
+          if (!isNew) f.id = r.id; // the line number is the record key that buses point at
           if (isNew && routeOf(f.id)) { toast(`Line ${f.id} already exists.`, 'warn', 'alert'); return false; }
           const target = r || {};
           Object.assign(target, { id: f.id, name: f.name, headway: +f.headway || 10, fare: +f.fare || 0, color: f.color, kind: f.kind, stops: [...sel] });
@@ -865,7 +1096,7 @@ VIEWS.drivers = {
       <div class="input-ic grow">${icon('search')}<input class="input" id="dv-q" placeholder="Search name or ID"></div><button class="btn primary" id="dv-add">${icon('plus')}Add driver</button></div><div class="cards" id="dv-out"></div>`;
     $('#dv-seg').onclick = e => { const b = e.target.closest('[data-s]'); if (b) { drvFilter = b.dataset.s; this.render(el); } };
     $('#dv-q').oninput = () => this.draw();
-    $('#dv-add').onclick = () => driverModal();
+    $('#dv-add').onclick = () => { if (guard('drivers.add')) driverModal(); };
     this.draw();
   },
   draw() {
@@ -885,7 +1116,7 @@ VIEWS.drivers = {
 };
 function driverModal(d) {
   const isNew = !d;
-  d = d || { id: 'D' + (Math.max(...S.drivers.map(x => +x.id.slice(1))) + 1), name: '', phone: '', status: 'standby', busId: null, hoursWeek: 0, rating: 5, licenseExp: new Date(Date.now() + 365 * 864e5).toISOString().slice(0, 10), since: new Date().getFullYear(), color: AV_COLORS[S.drivers.length % AV_COLORS.length], km: 0 };
+  d = d || { id: 'D' + (Math.max(200, ...S.drivers.map(x => +x.id.slice(1) || 0)) + 1), name: '', phone: '', status: 'standby', busId: null, hoursWeek: 0, rating: 5, licenseExp: new Date(Date.now() + 365 * 864e5).toISOString().slice(0, 10), since: new Date().getFullYear(), color: AV_COLORS[S.drivers.length % AV_COLORS.length], km: 0 };
   const myTrips = TRIPS.filter(t => t.driverId === d.id);
   openModal({
     title: isNew ? 'Add driver' : esc(d.name), wide: !isNew,
@@ -900,10 +1131,11 @@ function driverModal(d) {
       ${myTrips.length ? `<div><div class="eyebrow" style="margin-bottom:6px">Today's duty</div><div class="stop-picker">${myTrips.slice(0, 12).map(t => `<span class="chip nodot">${fmtTime(t.start)} ${t.routeId} · ${t.busId}</span>`).join('')}</div></div>` : ''}`,
     actions: [{ label: 'Cancel' }, {
       label: isNew ? 'Add driver' : 'Save', kind: 'primary', onClick: m => {
+        if (!guard(isNew ? 'drivers.add' : 'drivers.edit')) return false;
         if (!requireFields(m, ['name'])) return false;
         const f = readForm(m);
+        if (f.status !== 'duty' && d.busId) { const b = bus(d.busId); if (b && b.status === 'service') { toast(`${d.name} still drives ${b.id}. Reassign the bus first.`, 'warn', 'alert'); return false; } }
         Object.assign(d, { name: f.name, phone: f.phone, status: f.status, licenseExp: f.licenseExp, hoursWeek: +f.hoursWeek || 0 });
-        if (f.status !== 'duty' && d.busId) { const b = bus(d.busId); if (b && b.status === 'service') { toast(`${d.name} still drives ${b.id}. Reassign the bus first.`, 'warn', 'alert'); d.status = 'duty'; return false; } }
         if (isNew) S.drivers.push(d);
         save(); route(); toast(isNew ? `${d.name} added` : `${d.name} updated`);
       }
@@ -926,9 +1158,9 @@ VIEWS.schedule = {
         <div class="big-stat"><div class="l">Trips today</div><div class="v">${trips.length}</div><div class="d">${busesWith.length} vehicle blocks</div></div>
         <div class="big-stat"><div class="l">Completed</div><div class="v" style="color:var(--ok)">${st.done}</div><div class="d">${trips.length ? Math.round(st.done / trips.length * 100) : 0}% of the day</div></div>
         <div class="big-stat"><div class="l">Running now</div><div class="v" style="color:var(--accent-ink)">${st.running}</div><div class="d">planned ahead: ${st.planned}</div></div>
-        <div class="big-stat"><div class="l">Cancelled</div><div class="v" style="color:var(--crit)">${st.cancelled}</div><div class="d">lost service minutes ${trips.filter(t => S.cancelled[t.id]).reduce((a, t) => a + t.end - t.start, 0)}</div></div></div>
+        <div class="big-stat"><div class="l">Cancelled</div><div class="v" style="color:var(--crit)">${st.cancelled}</div><div class="d">lost service minutes ${trips.filter(t => isCancelled(t.id)).reduce((a, t) => a + t.end - t.start, 0)}</div></div></div>
       <div class="toolbar"><div class="seg" id="sc-seg"><button data-l="all" class="${schedLine === 'all' ? 'on' : ''}">All lines</button>${S.routes.map(r => `<button data-l="${r.id}" class="${schedLine === r.id ? 'on' : ''}">${r.id}</button>`).join('')}</div>
-        <span class="grow"></span><span class="muted" style="font-size:13px">Tap a trip to reassign driver or cancel. Dotted line marks the 14:00 driver relief.</span></div>
+        <span class="grow"></span><span class="muted" style="font-size:13px">${can('dispatch') ? 'Tap a trip to reassign driver or cancel.' : 'Tap a trip for details.'} Dotted line marks the 14:00 driver relief.</span></div>
       <div class="gantt-wrap" id="sc-wrap"><div class="gantt">
         <div class="g-row head"><div class="g-label">Vehicle block</div><div class="g-track">${Array.from({ length: H1 - H0 }, (_, i) => `<span class="g-hour" style="left:${i * PX}px">${pad(H0 + i)}:00</span>`).join('')}</div></div>
         ${busesWith.map(bid => {
@@ -954,12 +1186,12 @@ function tripModal(t) {
     title: `Trip ${esc(t.id)}`,
     body: `<div style="display:flex;gap:12px;align-items:center">${bullet(r.id, true)}<div><b>${esc(from)} → ${esc(to)}</b><div class="muted">${fmtTime(t.start)} – ${fmtTime(t.end)} · ${t.end - t.start} min · ${t.busId}</div></div><span style="margin-left:auto" class="chip ${st === 'running' ? 'accent' : st === 'done' ? 'ok' : st === 'cancelled' ? 'crit' : 'info'}">${st[0].toUpperCase() + st.slice(1)}</span></div>
       ${field({ id: 'driverId', label: 'Driver for this trip', type: 'select', value: t.driverId, options: avail.map(d => [d.id, `${d.name} · ${DSTATUS[d.status].label}`]) })}`,
-    actions: [
-      st === 'cancelled' ? { label: 'Restore trip', icon: 'undo', onClick: () => { delete S.cancelled[t.id]; save(); route(); toast(`Trip ${t.id} restored`); } }
-        : st !== 'done' ? { label: 'Cancel trip', kind: 'danger', onClick: () => { S.cancelled[t.id] = true; save(); route(); toast(`Trip ${t.id} cancelled. Passengers informed on displays.`, 'warn', 'x'); } } : null,
+    actions: (can('dispatch') ? [
+      st === 'cancelled' ? { label: 'Restore trip', icon: 'undo', onClick: () => { setOvr(t.id, { cancelled: false }); save(); route(); toast(`Trip ${t.id} restored`); } }
+        : st !== 'done' ? { label: 'Cancel trip', kind: 'danger', onClick: () => { setOvr(t.id, { cancelled: true }); save(); route(); toast(`Trip ${t.id} cancelled. Passengers informed on displays.`, 'warn', 'x'); } } : null,
       { label: 'Close' },
-      { label: 'Save assignment', kind: 'primary', onClick: m => { t.driverId = readForm(m).driverId; route(); toast(`${driver(t.driverId).name} assigned to ${fmtTime(t.start)} trip`); } }
-    ].filter(Boolean)
+      { label: 'Save assignment', kind: 'primary', onClick: m => { const id = readForm(m).driverId; setOvr(t.id, { driverId: id }); t.driverId = id; save(); route(); toast(`${driver(id).name} assigned to ${fmtTime(t.start)} trip`); } }
+    ] : [{ label: 'Close' }]).filter(Boolean)
   });
 }
 
@@ -998,13 +1230,14 @@ VIEWS.tickets = {
         </tbody></table></div></div>`;
     $$('[data-dep]', el).forEach(b => b.onclick = () => { tkDep = +b.dataset.dep; tkSeat = null; this.render(el); });
     $$('[data-seat]', el).forEach(b => b.onclick = () => { tkSeat = +b.dataset.seat; $$('.seat.sel', el).forEach(s => s.classList.remove('sel')); b.classList.add('sel'); $('#tk-seat-l').textContent = 'No. ' + tkSeat; $('#tk-issue').disabled = false; });
-    $$('[data-refund]', el).forEach(b => b.onclick = () => { const bk = S.bookings.find(x => x.id === b.dataset.refund); S.bookings = S.bookings.filter(x => x !== bk); save(); this.render(el); toast(`Ticket ${bk.id} refunded · seat ${bk.seat} released`, 'warn', 'undo'); });
+    $$('[data-refund]', el).forEach(b => b.onclick = () => { if (!guard('tickets')) return; const bk = S.bookings.find(x => x.id === b.dataset.refund); S.bookings = S.bookings.filter(x => x !== bk); save(); this.render(el); toast(`Ticket ${bk.id} refunded · seat ${bk.seat} released`, 'warn', 'undo'); });
     $('#tk-issue').onclick = () => {
+      if (!guard('tickets')) return;
       const f = readForm(el);
       if (!f['tk-name']) { $('#f-tk-name').focus(); toast('Enter the passenger name to issue the ticket.', 'warn', 'alert'); return; }
       const mult = { Adult: 1, Student: .6, Senior: .5, Child: .4 }[f['tk-type']];
-      const bk = { id: uid('TK-'), dep: tkDep, seat: tkSeat, name: f['tk-name'], type: f['tk-type'], fare: Math.round(fare * mult * 100) / 100, issued: Date.now() };
-      S.bookings.push(bk); S.revenueToday += bk.fare; lastTicket = bk; tkSeat = null; save();
+      const bk = { id: uid('TK-'), date: localDate(), dep: tkDep, seat: tkSeat, name: f['tk-name'], type: f['tk-type'], fare: Math.round(fare * mult * 100) / 100, issued: Date.now() };
+      S.bookings.push(bk); lastTicket = bk; tkSeat = null; save();
       this.render(el); toast(`Ticket issued · seat ${bk.seat}, ${fmtTime(bk.dep)}`);
     };
     if (lastTicket && lastTicket.dep === tkDep) this.showTicket(lastTicket, coach);
@@ -1040,16 +1273,17 @@ VIEWS.maintenance = {
     const spend = S.workOrders.reduce((a, w) => a + (+w.cost || 0), 0);
     el.innerHTML = `<div class="big-stats">
         <div class="big-stat"><div class="l">Open work orders</div><div class="v">${S.workOrders.filter(w => w.status !== 'done').length}</div><div class="d">${S.workOrders.filter(w => w.status === 'doing').length} in the workshop now</div></div>
-        <div class="big-stat"><div class="l">Fleet availability</div><div class="v">${Math.round(S.buses.filter(b => b.status !== 'maint' && b.status !== 'oos').length / S.buses.length * 100)}%</div><div class="d">target 90%</div></div>
+        <div class="big-stat"><div class="l">Fleet availability</div><div class="v">${S.buses.length ? Math.round(S.buses.filter(b => b.status !== 'maint' && b.status !== 'oos').length / S.buses.length * 100) : 0}%</div><div class="d">target 90%</div></div>
         <div class="big-stat"><div class="l">Service due &lt; 2,500 km</div><div class="v" style="color:var(--warn)">${dueSoon.length}</div><div class="d">${dueSoon.slice(0, 3).map(b => b.id).join(', ') || 'none'}</div></div>
         <div class="big-stat"><div class="l">Parts &amp; labour this month</div><div class="v">${moneyK(spend)}</div><div class="d">${S.workOrders.length} orders</div></div></div>
-      <div class="toolbar"><span class="grow muted">Drag cards between columns, or use the arrows. Moving a card to “In workshop” takes the bus out of service.</span><button class="btn primary" id="wo-add">${icon('plus')}New work order</button></div>
+      <div class="toolbar"><span class="grow muted">${can('maint') ? 'Drag cards between columns, or use the arrows. Moving a card to “In workshop” takes the bus out of service.' : 'Read-only: the workshop and dispatch manage work orders.'}</span>${can('maint') ? `<button class="btn primary" id="wo-add">${icon('plus')}New work order</button>` : ''}</div>
       <div class="kanban">${cols.map(([k, l]) => { const items = S.workOrders.filter(w => w.status === k); return `<div class="k-col" data-col="${k}"><h3>${l}<span class="n">${items.length}</span></h3>
         ${items.map(w => { const dd = daysTo(w.due); return `<div class="wo" draggable="true" data-wo="${w.id}"><div class="row"><span class="mono muted">${w.id}</span><span class="chip nodot ${w.type === 'Corrective' ? 'crit' : w.type === 'Preventive' ? 'ok' : w.type === 'Inspection' ? 'info' : 'accent'}">${w.type}</span></div>
           <b>${esc(w.title)}</b><div class="row" style="font-size:13px"><span>${icon('bus')} ${w.busId}</span><span class="muted">· ${esc(w.mechanic)}</span></div>
           <div class="foot"><span style="color:${k !== 'done' && dd < 0 ? 'var(--crit)' : 'inherit'}">${k === 'done' ? 'Closed' : dd === 0 ? 'Due today' : dd < 0 ? `${-dd} d overdue` : `Due in ${dd} d`} · ${w.cost ? money(+w.cost) : 'quote pending'}</span>
           <span class="moves">${k !== 'todo' ? `<button data-mv="-1" aria-label="Move back">‹</button>` : ''}${k !== 'done' ? `<button data-mv="1" aria-label="Move forward">›</button>` : ''}</span></div></div>`; }).join('') || '<div class="empty" style="padding:20px">Nothing here</div>'}
       </div>`; }).join('')}</div>`;
+    if (!can('maint')) { $$('.wo .moves', el).forEach(x => x.remove()); $$('.wo', el).forEach(c => { c.draggable = false; c.style.cursor = 'default'; }); return; }
     $('#wo-add').onclick = () => woModal();
     const order = ['todo', 'doing', 'done'];
     $$('.wo', el).forEach(c => {
@@ -1065,10 +1299,10 @@ VIEWS.maintenance = {
   }
 };
 function moveWO(w, to) {
-  if (!to || w.status === to) return;
+  if (!to || w.status === to || !guard('maint')) return;
   w.status = to; const b = bus(w.busId);
   if (b) {
-    if (to === 'doing' && b.status === 'service') { const d = driver(b.driverId); if (d) d.status = 'standby'; }
+    if (to === 'doing' && b.status === 'service' && can('drivers.edit')) { const d = driver(b.driverId); if (d) d.status = 'standby'; }
     if (to === 'doing') b.status = 'maint';
     if (to === 'done' && b.status === 'maint' && !S.workOrders.some(x => x.busId === b.id && x.status === 'doing')) { b.status = 'depot'; if (w.type === 'Preventive') b.nextService = 15000; }
   }
@@ -1088,12 +1322,14 @@ function woModal(w = {}) {
       ${field({ id: 'cost', label: `Estimated cost (${S.settings.currency})`, type: 'number', value: w.cost ?? '', min: 0 })}
       </div>`,
     actions: [
-      ...(!isNew ? [{ label: 'Delete', kind: 'danger', onClick: () => { S.workOrders = S.workOrders.filter(x => x !== w); save(); route(); toast(`${w.id} deleted`, 'warn'); } }] : []),
+      ...(!isNew ? [{ label: 'Delete', kind: 'danger', onClick: () => { if (!guard('maint')) return false; S.workOrders = S.workOrders.filter(x => x !== w); save(); route(); toast(`${w.id} deleted`, 'warn'); } }] : []),
       { label: 'Cancel' },
       { label: isNew ? 'Create work order' : 'Save', kind: 'primary', onClick: m => {
+        if (!guard('maint')) return false;
         if (!requireFields(m, ['title'])) return false;
         const f = readForm(m);
-        if (isNew) { S.workOrders.push({ id: 'WO-' + (4810 + S.workOrders.length + Math.floor(Math.random() * 90)), status: 'todo', ...f, cost: +f.cost || 0 }); }
+        if (!f.busId) { toast('Add a bus to the fleet before creating work orders.', 'warn', 'alert'); return false; }
+        if (isNew) { S.workOrders.push({ id: uid('WO-'), status: 'todo', ...f, cost: +f.cost || 0 }); }
         else Object.assign(w, f, { cost: +f.cost || 0 });
         save(); if (location.hash !== '#maintenance') location.hash = 'maintenance'; else route();
         toast(isNew ? `Work order created for ${f.busId}` : 'Work order saved');
@@ -1110,13 +1346,13 @@ VIEWS.alerts = {
     const list = S.alerts.filter(a => alFilter === 'all' ? true : alFilter === 'open' ? a.status !== 'resolved' : a.status === alFilter);
     const c = s => s === 'all' ? S.alerts.length : s === 'open' ? openAlerts().length : S.alerts.filter(a => a.status === s).length;
     el.innerHTML = `<div class="toolbar"><div class="seg" id="al-seg">${[['open', 'Open'], ['ack', 'Acknowledged'], ['resolved', 'Resolved'], ['all', 'All']].map(([k, l]) => `<button data-s="${k}" class="${alFilter === k ? 'on' : ''}">${l} <span class="muted">${c(k)}</span></button>`).join('')}</div><span class="grow"></span>
-      <button class="btn" id="al-ackall">${icon('check')}Acknowledge all</button><button class="btn primary" id="al-new">${icon('plus')}Log incident</button></div>
+      ${can('alerts.manage') ? `<button class="btn" id="al-ackall">${icon('check')}Acknowledge all</button>` : ''}${can('alerts.raise') ? `<button class="btn primary" id="al-new">${icon('plus')}Log incident</button>` : ''}</div>
       <div class="card" style="padding:0">${list.map(a => `<div class="alert-item ${a.status}"><span class="sev ${a.severity}"></span><span class="ai-ic ${a.severity}">${icon(a.severity === 'info' ? 'bell' : 'alert')}</span>
         <div style="min-width:0"><b>${esc(a.title)}</b><div class="meta">${esc(a.detail)}</div><div class="meta">${new Date(a.time).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} · ${ago(a.time)}${a.busId ? ` · ${a.busId}` : ''}${a.status === 'ack' ? ' · <span style="color:var(--info)">acknowledged</span>' : a.status === 'resolved' ? ' · <span style="color:var(--ok)">resolved</span>' : ''}</div></div>
-        <div class="acts">${a.busId && bus(a.busId)?.status === 'service' ? `<button class="btn sm" data-locate="${a.busId}">${icon('pin')}Locate</button>` : ''}${a.status === 'open' ? `<button class="btn sm" data-ack="${a.id}">Acknowledge</button>` : ''}${a.status !== 'resolved' ? `<button class="btn sm primary" data-res="${a.id}">Resolve</button>` : ''}</div></div>`).join('') || `<div class="empty">${icon('shield')}<div>All clear. Nothing in this list.</div></div>`}</div>`;
+        <div class="acts">${a.busId && bus(a.busId)?.status === 'service' ? `<button class="btn sm" data-locate="${a.busId}">${icon('pin')}Locate</button>` : ''}${a.status === 'open' && can('alerts.manage') ? `<button class="btn sm" data-ack="${a.id}">Acknowledge</button>` : ''}${a.status !== 'resolved' && can('alerts.manage') ? `<button class="btn sm primary" data-res="${a.id}">Resolve</button>` : ''}</div></div>`).join('') || `<div class="empty">${icon('shield')}<div>All clear. Nothing in this list.</div></div>`}</div>`;
     $('#al-seg').onclick = e => { const b = e.target.closest('[data-s]'); if (b) { alFilter = b.dataset.s; this.render(el); } };
-    $('#al-new').onclick = () => incidentModal();
-    $('#al-ackall').onclick = () => { S.alerts.forEach(a => { if (a.status === 'open') a.status = 'ack'; }); save(); this.render(el); updateChrome(); toast('All open alerts acknowledged'); };
+    if ($('#al-new')) $('#al-new').onclick = () => incidentModal();
+    if ($('#al-ackall')) $('#al-ackall').onclick = () => { S.alerts.forEach(a => { if (a.status === 'open') a.status = 'ack'; }); save(); this.render(el); updateChrome(); toast('All open alerts acknowledged'); };
     $$('[data-ack]', el).forEach(b => b.onclick = () => { S.alerts.find(a => a.id === b.dataset.ack).status = 'ack'; save(); this.render(el); updateChrome(); });
     $$('[data-res]', el).forEach(b => b.onclick = () => { S.alerts.find(a => a.id === b.dataset.res).status = 'resolved'; save(); this.render(el); updateChrome(); toast('Alert resolved'); });
     $$('[data-locate]', el).forEach(b => b.onclick = () => { mapSel = b.dataset.locate; location.hash = 'map'; });
@@ -1125,6 +1361,7 @@ VIEWS.alerts = {
   tick() { if (S.alerts.length !== this.count && !$('#overlay').children.length) this.render($('#view')); }
 };
 function incidentModal(busId) {
+  if (!guard('alerts.raise')) return;
   openModal({
     title: 'Log incident',
     body: `<div class="form-grid">
@@ -1136,20 +1373,22 @@ function incidentModal(busId) {
     actions: [{ label: 'Cancel' }, { label: 'Log incident', kind: 'primary', onClick: m => {
       if (!requireFields(m, ['title'])) return false;
       const f = readForm(m);
-      raiseAlert({ severity: f.severity, title: f.title, detail: f.detail || 'Logged by dispatch.', busId: f.busId || null, type: 'incident' });
-      save(); if (current === VIEWS.alerts) route();
+      raiseAlert({ severity: f.severity, title: f.title, detail: f.detail || `Logged by ${MODE === 'cloud' ? ME.full_name : 'dispatch'}.`, busId: f.busId || null, type: 'incident' });
+      if (current === VIEWS.alerts) route();
     } }]
   });
 }
 function messageModal(b) {
+  if (!guard('dispatch')) return;
   const d = driver(b.driverId);
+  if (!d) { toast(`${b.id} has no driver assigned to message.`, 'warn', 'alert'); return; }
   openModal({
     title: `Message ${esc(d?.name || b.id)}`,
     body: `<div class="stop-picker" id="quick">${['Hold at next stop for 2 min', 'Skip next stop, running bunched', 'Short-turn at Central Station', 'Detour active: follow diversion signs', 'Call dispatch when safe'].map(t => `<button type="button">${t}</button>`).join('')}</div>${field({ id: 'text', label: 'Message', type: 'textarea', full: true, placeholder: 'Shows on the driver’s console' })}`,
     onMount: m => { $('#quick', m).onclick = e => { if (e.target.tagName === 'BUTTON') $('[data-f="text"]', m).value = e.target.textContent; }; },
     actions: [{ label: 'Cancel' }, { label: 'Send to driver console', kind: 'primary', icon: 'message', onClick: m => {
       const t = readForm(m).text; if (!t) { toast('Write a message or pick a quick reply.', 'warn', 'alert'); return false; }
-      S.messages.unshift({ id: uid('M'), to: b.driverId, from: 'Dispatch', text: t, time: Date.now() }); save();
+      S.messages.unshift({ id: uid('M'), to: b.driverId, from: MODE === 'cloud' ? ME.full_name : 'Dispatch', text: t, time: Date.now() }); save();
       toast(`Sent to ${d?.name || b.id}'s console`, 'ok', 'message');
     } }]
   });
@@ -1176,7 +1415,7 @@ VIEWS.reports = {
         <div class="card"><div class="card-h"><h3>Daily boardings</h3><span class="sub">today is partial</span></div>${barChart({ items: days.map((d, i) => ({ label: d.toLocaleDateString('en-GB', { weekday: 'short' }), value: ride[i], color: i === 6 ? 'var(--accent)' : 'var(--info)', showVal: true })), h: 240, fmt: v => v >= 1000 ? (v / 1000).toFixed(v % 1000 ? 1 : 0) + 'k' : Math.round(v) })}</div>
         <div class="card"><div class="card-h"><h3>Revenue by line</h3></div>${hbarChart({ items: byRoute, fmt: v => moneyK(v) })}</div>
         <div class="card"><div class="card-h"><h3>On-time performance by line</h3><span class="sub">share of trips within 3 min</span></div>${hbarChart({ items: otp, max: 100, fmt: v => v + '%' })}</div>
-        <div class="card"><div class="card-h"><h3>Fleet energy mix</h3></div>${(() => { const mix = ['Electric', 'Diesel', 'CNG', 'Hydrogen'].map((f, i) => ({ label: f, value: S.buses.filter(b => b.fuel === f).length, color: ['var(--ok)', 'var(--muted)', 'var(--info)', 'var(--accent)'][i] })).filter(x => x.value); return `<div class="donut-wrap">${donut(mix, 160, Math.round(ev / S.buses.length * 100) + '%', 'electric')}<div class="legend">${mix.map(i => `<span><span style="display:inline-flex;gap:6px;align-items:center"><i style="background:${i.color}"></i>${i.label}</span><b>${i.value}</b></span>`).join('')}</div></div>`; })()}</div>
+        <div class="card"><div class="card-h"><h3>Fleet energy mix</h3></div>${(() => { const mix = ['Electric', 'Diesel', 'CNG', 'Hydrogen'].map((f, i) => ({ label: f, value: S.buses.filter(b => b.fuel === f).length, color: ['var(--ok)', 'var(--muted)', 'var(--info)', 'var(--accent)'][i] })).filter(x => x.value); return `<div class="donut-wrap">${donut(mix, 160, (S.buses.length ? Math.round(ev / S.buses.length * 100) : 0) + '%', 'electric')}<div class="legend">${mix.map(i => `<span><span style="display:inline-flex;gap:6px;align-items:center"><i style="background:${i.color}"></i>${i.label}</span><b>${i.value}</b></span>`).join('')}</div></div>`; })()}</div>
       </div>
       <div class="card"><div class="card-h"><h3>Export</h3><span class="sub">CSV for spreadsheets or your BI tool</span><span class="spacer"></span><button class="btn" id="rp-copy">${icon('copy')}Copy CSV</button></div><pre class="mono" style="margin:0;max-height:160px;overflow:auto;background:var(--surface-2);padding:12px;border-radius:10px;user-select:all">${esc(csv)}</pre></div>`;
     $('#rp-copy').onclick = () => copyText(csv, 'CSV copied to clipboard');
@@ -1185,15 +1424,22 @@ VIEWS.reports = {
 
 // ---- Driver app (the phone experience)
 let daDriver = null;
+const CHECK_ITEMS = ['Tyres and wheel nuts', 'Lights and indicators', 'Doors and ramp', 'Mirrors and cameras', 'Fire extinguisher, first-aid kit'];
 VIEWS.driverapp = {
-  title: 'Driver app', crumb: 'Mobile preview',
+  title: () => role() === 'driver' ? 'My shift' : 'Driver app',
+  crumb: () => role() === 'driver' ? 'Driver console' : 'Mobile preview',
   render(el) {
+    if (role() === 'driver') {
+      daDriver = ME?.driver_id || null;
+      el.innerHTML = `<div class="driver-stage solo"><div class="phone"><div class="phone-screen" id="da-screen"></div></div></div>`;
+      return this.screen();
+    }
     const onDuty = S.drivers.filter(d => d.status === 'duty' && bus(d.busId)?.status === 'service');
     if (!daDriver || !onDuty.find(d => d.id === daDriver)) daDriver = onDuty[0]?.id;
     el.innerHTML = `<div class="driver-stage">
       <div class="card" style="display:flex;flex-direction:column;gap:14px">
         <div class="card-h" style="margin:0"><h3>The same platform, in the driver's cab</h3></div>
-        <p style="margin:0;max-width:62ch" class="muted">This screen is what a driver sees on the in-cab tablet or their phone. Messages sent from the live map arrive here, issues reported here land in the control room alerts, and the pre-trip check is stored per shift.</p>
+        <p style="margin:0;max-width:62ch" class="muted">This is what a driver sees when they sign in with the Driver role on a phone or in-cab tablet. Messages sent from the live map arrive here, issues reported here land in the control room alerts, and the pre-trip check is stored per shift.</p>
         ${field({ id: 'da-d', label: 'Preview as driver', type: 'select', value: daDriver, options: onDuty.map(d => [d.id, `${d.name} · ${d.busId}`]) })}
         <div class="legend"><span>${icon('message')} Two-way messaging</span><span>${icon('shield')} Pre-trip safety check</span><span>${icon('alert')} One-tap issue reporting</span><span>${icon('clock')} Live headway status</span></div>
       </div>
@@ -1202,64 +1448,143 @@ VIEWS.driverapp = {
     this.screen();
   },
   screen() {
-    const box = $('#da-screen'); const d = driver(daDriver); if (!box) return;
-    if (!d) { box.innerHTML = `<div class="empty">${icon('user')}<div>No drivers on duty.</div></div>`; return; }
-    const b = bus(d.busId); const r = routeOf(b.routeId); const ns = nextStops(b, 4);
-    const ck = S.checklist[d.id] || {}; const items = ['Tyres and wheel nuts', 'Lights and indicators', 'Doors and ramp', 'Mirrors and cameras', 'Fire extinguisher, first-aid kit'];
-    const done = items.filter(i => ck[i]).length; const tripOn = S.driverTrip[d.id] !== false;
-    const msgs = S.messages.filter(m => m.to === d.id).slice(0, 3);
+    const box = $('#da-screen'); if (!box) return;
+    const d = driver(daDriver);
+    if (!d) {
+      box.innerHTML = `<div class="empty" style="padding:60px 20px">${icon('user')}<div>${role() === 'driver' ? 'Your account isn’t linked to a driver record yet. Ask an admin to link it under Preferences, Team & roles.' : 'No drivers on duty.'}</div></div>`;
+      return;
+    }
+    const b = bus(d.busId); const r = b && routeOf(b.routeId);
+    const msgs = S.messages.filter(m => m.to === d.id).sort((x, y) => y.time - x.time).slice(0, 3);
     const t = new Date();
-    box.innerHTML = `<div class="ph-status"><span>${pad(t.getHours())}:${pad(t.getMinutes())}</span><span>5G ▮▮▮ 82%</span></div>
+    const status = `<div class="ph-status"><span>${pad(t.getHours())}:${pad(t.getMinutes())}</span><span>5G ▮▮▮ 82%</span></div>`;
+    const msgCard = `<div class="ph-next"><div class="eyebrow" style="display:flex;justify-content:space-between"><span>Messages from dispatch</span><span>${msgs.length}</span></div>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">${msgs.map(m => `<div class="msg">${esc(m.text)}<time>${esc(m.from)} · ${ago(m.time)}</time></div>`).join('') || '<span class="muted" style="font-size:13px">No messages yet.</span>'}</div></div>`;
+    if (!b || b.status !== 'service' || !r) {
+      box.innerHTML = `${status}<div class="ph-head"><div class="who">${avatar(d)}<div><b>${esc(d.name)}</b><br><small>${DSTATUS[d.status].label}</small></div></div></div>
+        <div class="ph-body"><div class="ph-next"><div class="eyebrow">This shift</div><div class="stop" style="font-size:24px">No bus assigned right now</div><p class="muted" style="margin:6px 0 0">Dispatch assigns your vehicle. It appears here as soon as they do.</p></div>${msgCard}</div>`;
+      return;
+    }
+    const ns = nextStops(b, 4);
+    const sh = shiftOf(d.id) || { checklist: {}, onTrip: true };
+    const ck = sh.checklist || {}; const done = CHECK_ITEMS.filter(i => ck[i]).length; const tripOn = sh.onTrip !== false;
+    const mayReport = can('alerts.raise'); const mayShift = MODE === 'local' || can('dispatch') || ME?.driver_id === d.id;
+    box.innerHTML = `${status}
       <div class="ph-head"><div class="who">${avatar(d)}<div><b>${esc(d.name)}</b><br><small>${b.id} · ${esc(b.plate)}</small></div><span style="margin-left:auto">${bullet(r.id, true)}</span></div>
         <div style="display:flex;justify-content:space-between;font-size:13px"><span>to <b>${esc(terminusOf(b))}</b></span><span>${b.delay > 2 ? `<b style="color:#ff9b7a">+${b.delay} min late</b>` : '<b style="color:#6fe0ae">On schedule</b>'}</span></div></div>
       <div class="ph-body">
         <div class="ph-next"><div class="eyebrow">Next stop · ${ns[0]?.eta ?? '—'} min</div><div class="stop">${esc(ns[0]?.stop.name || 'Terminus')}</div>
           <div class="next-stops" style="--route:${r.color};margin-top:10px">${ns.slice(1).map(n => `<div style="font-weight:400">${esc(n.stop.name)}<time>${n.eta} min</time></div>`).join('')}</div></div>
         <div class="ph-btns">
-          <button class="ph-btn ${tripOn ? 'stop' : 'go'}" id="da-trip">${icon(tripOn ? 'pause' : 'play')}${tripOn ? 'End trip' : 'Start trip'}</button>
-          <button class="ph-btn" data-issue="Passenger needs assistance">${icon('user')}Passenger help</button>
+          ${mayShift ? `<button class="ph-btn ${tripOn ? 'stop' : 'go'}" id="da-trip">${icon(tripOn ? 'pause' : 'play')}${tripOn ? 'End trip' : 'Start trip'}</button>` : ''}
+          ${mayReport ? `<button class="ph-btn" data-issue="Passenger needs assistance">${icon('user')}Passenger help</button>
           <button class="ph-btn" data-issue="Vehicle fault reported by driver">${icon('wrench')}Vehicle fault</button>
           <button class="ph-btn" data-issue="Traffic blockage ahead">${icon('alert')}Road blocked</button>
-          <button class="ph-btn" data-issue="Security incident on board" style="color:var(--crit)">${icon('shield')}Emergency</button>
+          <button class="ph-btn" data-issue="Security incident on board" style="color:var(--crit)">${icon('shield')}Emergency</button>` : ''}
         </div>
-        <div class="ph-next"><div class="eyebrow" style="display:flex;justify-content:space-between"><span>Messages from dispatch</span><span>${msgs.length}</span></div>
-          <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">${msgs.map(m => `<div class="msg">${esc(m.text)}<time>${ago(m.time)}</time></div>`).join('') || '<span class="muted" style="font-size:13px">No messages yet. Send one from the live map.</span>'}</div></div>
-        <div class="ph-next"><div class="eyebrow" style="display:flex;justify-content:space-between"><span>Pre-trip check</span><span>${done}/${items.length}</span></div><div class="bar" style="margin:8px 0"><i style="width:${done / items.length * 100}%"></i></div>
-          ${items.map((it, i) => `<label class="check-row"><input type="checkbox" id="ck-${i}" data-ck="${esc(it)}" ${ck[it] ? 'checked' : ''}>${esc(it)}</label>`).join('')}</div>
+        ${msgCard}
+        <div class="ph-next"><div class="eyebrow" style="display:flex;justify-content:space-between"><span>Pre-trip check</span><span>${done}/${CHECK_ITEMS.length}</span></div><div class="bar" style="margin:8px 0"><i style="width:${done / CHECK_ITEMS.length * 100}%"></i></div>
+          ${CHECK_ITEMS.map((it, i) => `<label class="check-row"><input type="checkbox" id="ck-${i}" data-ck="${esc(it)}" ${ck[it] ? 'checked' : ''} ${mayShift ? '' : 'disabled'}>${esc(it)}</label>`).join('')}</div>
       </div>`;
-    $('#da-trip').onclick = () => { S.driverTrip[d.id] = !tripOn; save(); this.screen(); toast(tripOn ? `${d.name} ended the trip` : `${d.name} started the trip`, 'ok', tripOn ? 'pause' : 'play'); };
-    $$('[data-issue]', box).forEach(btn => btn.onclick = () => { const crit = btn.dataset.issue.startsWith('Security'); raiseAlert({ severity: crit ? 'critical' : 'warning', title: btn.dataset.issue, detail: `Reported from the cab by ${d.name} near ${ns[0]?.stop.name || 'terminus'}.`, busId: b.id, type: 'driver' }); save(); });
-    $$('[data-ck]', box).forEach(c => c.onchange = () => { S.checklist[d.id] = { ...ck, [c.dataset.ck]: c.checked }; save(); this.screen(); });
+    $('#da-trip')?.addEventListener('click', () => { setShift(d.id, { onTrip: !tripOn }); save(); this.screen(); toast(tripOn ? `${d.name} ended the trip` : `${d.name} started the trip`, 'ok', tripOn ? 'pause' : 'play'); });
+    $$('[data-issue]', box).forEach(btn => btn.onclick = () => { const crit = btn.dataset.issue.startsWith('Security'); raiseAlert({ severity: crit ? 'critical' : 'warning', title: btn.dataset.issue, detail: `Reported from the cab by ${d.name} near ${ns[0]?.stop.name || 'terminus'}.`, busId: b.id, type: 'driver' }); });
+    $$('[data-ck]', box).forEach(c => c.onchange = () => { setShift(d.id, { checklist: { ...ck, [c.dataset.ck]: c.checked } }); save(); this.screen(); });
   },
   tick() { if (Math.random() < .25 && !$('#da-screen input:focus')) this.screen(); }
 };
 
-// ---- Preferences
+// ---- Preferences: account, team, workspace
 let installEvt = null;
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; });
+const avatarMe = (cls = '') => `<span class="avatar ${cls}" style="background:${AV_COLORS[hashStr(ME?.id || 'x') % AV_COLORS.length]}">${esc(initials(ME?.full_name || ME?.email || '?').toUpperCase())}</span>`;
 VIEWS.preferences = {
-  title: 'Preferences', crumb: 'Workspace',
+  title: 'Preferences', crumb: 'Account & workspace',
   render(el) {
-    const theme = getTheme();
-    el.innerHTML = `<div class="card"><div class="settings-list">
-      <div class="set-row"><div class="txt"><b>Operator name</b><span>Shown on tickets and the dashboard greeting.</span></div><input class="input" id="pf-op" style="max-width:320px" value="${esc(S.settings.operator)}"></div>
-      <div class="set-row"><div class="txt"><b>Appearance</b><span>Follow the device, or pick light or dark. Dark suits night-shift control rooms.</span></div><div class="seg" id="pf-theme">${[['system', 'System'], ['light', 'Light'], ['dark', 'Dark']].map(([k, l]) => `<button data-t="${k}" class="${theme === k ? 'on' : ''}">${l}</button>`).join('')}</div></div>
-      <div class="set-row"><div class="txt"><b>Currency symbol</b><span>Used for fares, revenue and work-order costs.</span></div><div class="seg" id="pf-cur">${['€', '$', '£', '₺'].map(c => `<button data-c="${c}" class="${S.settings.currency === c ? 'on' : ''}">${c}</button>`).join('')}</div></div>
-      <div class="set-row"><div class="txt"><b>Simulation speed</b><span>Bus movement is simulated in this demo. Connect AVL/GPS feeds to replace it with live positions.</span></div><div class="seg" id="pf-speed">${[0, .5, 1, 2, 4].map(s => `<button data-s="${s}" class="${(S.settings.paused ? 0 : S.settings.speed) === s ? 'on' : ''}">${s === 0 ? 'Pause' : s + '×'}</button>`).join('')}</div></div>
-      <div class="set-row"><div class="txt"><b>Install as an app</b><span>Add Headway to the home screen or desktop. Works offline once installed.</span></div><button class="btn" id="pf-install">${icon('download')}Install</button></div>
-      <div class="set-row"><div class="txt"><b>Reset demo data</b><span>Restores the sample fleet, drivers, bookings and alerts. Your changes are lost.</span></div><div id="pf-reset-box"><button class="btn danger" id="pf-reset">Reset data</button></div></div>
+    const theme = getTheme(); const admin = can('settings'); const cloud = MODE === 'cloud';
+    const segOpts = (id, opts, cur, attr) => `<div class="seg" id="${id}">${opts.map(([v, l]) => `<button data-${attr}="${v}" class="${String(cur) === String(v) ? 'on' : ''}" ${admin || attr === 't' ? '' : 'disabled'}>${l}</button>`).join('')}</div>`;
+    el.innerHTML = `<div class="card"><div class="card-h"><h3>Account</h3></div>
+      ${cloud ? `<div class="acct">${avatarMe('lg')}<div style="flex:1;min-width:180px"><b>${esc(ME.full_name || ME.email)}</b><div class="muted">${esc(ME.email || '')}</div></div><span class="chip accent nodot">${ROLE_LABEL[ME.role]}</span><button class="btn" id="pf-out">${icon('logout')}Sign out</button></div>
+        <p class="muted" style="margin:12px 0 0">${ROLE_HINT[ME.role]}.</p>`
+      : `<div class="acct"><span class="avatar lg" style="background:var(--muted)">${icon('user')}</span><div style="flex:1;min-width:180px"><b>Demo mode</b><div class="muted">Sample data that stays in this browser only.</div></div>${sb ? `<button class="btn primary" id="pf-in">${icon('cloud')}Sign in to team workspace</button>` : ''}</div>`}
+    </div>
+    ${cloud && can('team') ? `<div class="card"><div class="card-h"><h3>Team &amp; roles</h3></div>
+      <p class="muted" style="margin:-6px 0 14px;max-width:75ch">Teammates create their own account on the sign-in page and start as Viewer. Set their role here, and link drivers to their driver record so their shift shows in the driver app. Changes apply on their screen right away.</p>
+      <div id="pf-team"><div class="muted">Loading team…</div></div></div>` : ''}
+    <div class="card"><div class="card-h"><h3>Workspace</h3>${!admin ? '<span class="sub">Only admins can change workspace settings.</span>' : ''}</div><div class="settings-list">
+      <div class="set-row"><div class="txt"><b>Operator name</b><span>Shown on tickets and the dashboard greeting.</span></div>${admin ? `<input class="input" id="pf-op" style="max-width:320px" value="${esc(S.settings.operator)}">` : `<b>${esc(S.settings.operator)}</b>`}</div>
+      <div class="set-row"><div class="txt"><b>Appearance</b><span>Follow the device, or pick light or dark. Saved on this device only.</span></div>${segOpts('pf-theme', [['system', 'System'], ['light', 'Light'], ['dark', 'Dark']], theme, 't')}</div>
+      <div class="set-row"><div class="txt"><b>Currency symbol</b><span>Used for fares, revenue and work-order costs.</span></div>${segOpts('pf-cur', ['€', '$', '£', '₺'].map(c => [c, c]), S.settings.currency, 'c')}</div>
+      <div class="set-row"><div class="txt"><b>Simulation speed</b><span>Bus movement is simulated until you connect AVL/GPS feeds. Every signed-in screen uses the same speed.</span></div>${segOpts('pf-speed', [.5, 1, 2, 4].map(s => [s, s + '×']), S.settings.speed, 's')}</div>
+      <div class="set-row"><div class="txt"><b>Install as an app</b><span>Add Headway to the home screen or desktop.</span></div><button class="btn" id="pf-install">${icon('download')}Install</button></div>
+      ${!cloud ? `<div class="set-row"><div class="txt"><b>Reset demo data</b><span>Restores the sample fleet, drivers, bookings and alerts in this browser. Your changes are lost.</span></div><div id="pf-reset-box"><button class="btn danger" id="pf-reset">Reset data</button></div></div>` : ''}
     </div></div>
-    <div class="card"><div class="card-h"><h3>Ready for mobile</h3></div><p class="muted" style="margin:0;max-width:70ch">The interface is a single responsive web app: a sidebar on desktop, a bottom tab bar on phones, safe-area aware, touch-friendly with pinch-zoom on the map. It ships with a web manifest and offline service worker, so it can be installed as a PWA today and wrapped with Capacitor for the App Store and Google Play without a rewrite.</p></div>`;
-    $('#pf-op').onchange = e => { S.settings.operator = e.target.value || 'Transit operator'; save(); toast('Operator name saved'); };
+    <div class="card"><div class="card-h"><h3>Ready for mobile</h3></div><p class="muted" style="margin:0;max-width:70ch">One responsive web app: a sidebar on desktop, a bottom tab bar on phones, safe-area aware, touch-friendly with pinch-zoom on the map. It installs as a PWA today and wraps with Capacitor for the App Store and Google Play without a rewrite.</p></div>`;
+    $('#pf-out')?.addEventListener('click', signOut);
+    $('#pf-in')?.addEventListener('click', toSignIn);
+    $('#pf-op')?.addEventListener('change', e => { if (!guard('settings')) return; S.settings.operator = e.target.value.trim() || 'Transit operator'; save(); toast('Operator name saved'); });
     $('#pf-theme').onclick = e => { const b = e.target.closest('[data-t]'); if (b) { setTheme(b.dataset.t); this.render(el); } };
-    $('#pf-cur').onclick = e => { const b = e.target.closest('[data-c]'); if (b) { S.settings.currency = b.dataset.c; save(); this.render(el); } };
-    $('#pf-speed').onclick = e => { const b = e.target.closest('[data-s]'); if (!b) return; const s = +b.dataset.s; S.settings.paused = s === 0; if (s) S.settings.speed = s; save(); this.render(el); toast(s ? `Simulation at ${s}×` : 'Simulation paused', 'ok', s ? 'play' : 'pause'); };
+    $('#pf-cur').onclick = e => { const b = e.target.closest('[data-c]'); if (b && guard('settings')) { S.settings.currency = b.dataset.c; save(); this.render(el); } };
+    $('#pf-speed').onclick = e => { const b = e.target.closest('[data-s]'); if (!b || !guard('settings')) return; S.settings.speed = +b.dataset.s; save(); this.render(el); toast(`Simulation at ${b.dataset.s}×`, 'ok', 'play'); };
     $('#pf-install').onclick = async () => { if (installEvt) { installEvt.prompt(); installEvt = null; } else toast('Use your browser menu: “Install app” or “Add to Home Screen”.', 'info', 'download'); };
-    $('#pf-reset').onclick = () => {
+    $('#pf-reset')?.addEventListener('click', () => {
       $('#pf-reset-box').innerHTML = `<div class="inline-confirm">Erase all changes?<button class="btn sm" id="pf-no">Keep</button><button class="btn sm primary" id="pf-yes">Reset</button></div>`;
       $('#pf-no').onclick = () => this.render(el);
       $('#pf-yes').onclick = () => { store.clear(); S = seedState(); TRIPS = buildTrips(); save(); mapSel = null; lastTicket = null; route(); toast('Demo data restored'); };
+    });
+    if (cloud && can('team')) this.team();
+  },
+  async team() {
+    if (!$('#pf-team')) return;
+    const { data, error } = await sb.from('profiles').select('*').order('created_at');
+    const box = $('#pf-team'); if (!box) return;
+    if (error) { box.innerHTML = `<div class="muted">Couldn’t load the team: ${esc(error.message)}</div>`; return; }
+    this.people = data;
+    box.innerHTML = `<div class="table-wrap"><table class="t"><thead><tr><th>Person</th><th>Role</th><th>Linked driver record</th><th>Joined</th></tr></thead><tbody>
+      ${data.map(p => `<tr style="cursor:default"><td><b>${esc(p.full_name || '—')}</b>${p.id === ME.id ? ' <span class="chip nodot">You</span>' : ''}<div class="muted" style="font-size:12.5px">${esc(p.email || '')}</div></td>
+        <td><select class="input" id="role-${p.id}" data-role="${p.id}" aria-label="Role for ${esc(p.full_name || p.email)}" style="min-width:140px">${Object.keys(ROLE_LABEL).map(r => `<option value="${r}" ${p.role === r ? 'selected' : ''}>${ROLE_LABEL[r]}</option>`).join('')}</select></td>
+        <td><select class="input" id="link-${p.id}" data-link="${p.id}" aria-label="Driver record for ${esc(p.full_name || p.email)}" style="min-width:190px"><option value="">Not a driver</option>${S.drivers.map(d => `<option value="${d.id}" ${p.driver_id === d.id ? 'selected' : ''}>${esc(d.name)} · ${d.id}</option>`).join('')}</select></td>
+        <td>${new Date(p.created_at).toLocaleDateString('en-GB')}</td></tr>`).join('')}
+    </tbody></table></div>`;
+    $$('[data-role]', box).forEach(s => s.onchange = () => this.updatePerson(s.dataset.role, { role: s.value }, s));
+    $$('[data-link]', box).forEach(s => s.onchange = () => this.updatePerson(s.dataset.link, { driver_id: s.value || null }, s));
+  },
+  async updatePerson(id, patch, ctl) {
+    const p = this.people.find(x => x.id === id); const who = p.full_name || p.email;
+    if (patch.role && p.role === 'admin' && patch.role !== 'admin' && this.people.filter(x => x.role === 'admin').length === 1) {
+      toast('Keep at least one admin. Make someone else admin first.', 'warn', 'shield'); ctl.value = 'admin'; return;
+    }
+    const { error } = await sb.from('profiles').update(patch).eq('id', id);
+    if (error) { toast(`Couldn’t update ${who}: ${error.message}`, 'crit', 'alert'); this.team(); return; }
+    Object.assign(p, patch);
+    toast(patch.role ? `${who} is now ${ROLE_LABEL[patch.role]}` : patch.driver_id ? `${who} linked to ${driver(patch.driver_id)?.name}` : `${who} unlinked from driver record`, 'ok', 'shield');
+    if (patch.role === 'driver' && !p.driver_id) toast(`Link ${who} to their driver record so their shift shows up.`, 'info', 'user');
+  }
+};
+
+// ---- First sign-in to an empty database
+let setupSkipped = false;
+const needsSetup = () => MODE === 'cloud' && !setupSkipped && !S.routes.length && !S.buses.length;
+VIEWS.setup = {
+  title: 'Set up your workspace', crumb: 'Welcome',
+  render(el) {
+    const admin = can('team');
+    el.innerHTML = `<div class="card setup">
+      <div class="eyebrow">${icon('cloud')} Connected to your team database</div>
+      <h2>Your workspace is empty</h2>
+      ${admin ? `<p>Start from a complete sample network with 6 lines, 24 buses, 28 drivers, work orders and coach bookings, then edit it into your own operation. Or start empty and add your lines, fleet and drivers yourself.</p>
+        <div class="toolbar"><button class="btn primary" id="su-sample">${icon('cloud')}Load sample network</button><button class="btn" id="su-empty">Start empty</button></div>`
+      : `<p>An admin hasn’t set up the network yet. When they do, it appears here automatically.</p>`}
+    </div>`;
+    if (!admin) return;
+    $('#su-sample').onclick = async e => {
+      const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Saving sample data…';
+      const seed = seedState();
+      for (const k of ['routes', 'drivers', 'buses', 'alerts', 'workOrders', 'bookings', 'messages']) S[k] = seed[k];
+      TRIPS = buildTrips(); simulate();
+      await sync();
+      route(); toast('Sample network saved to your database');
     };
+    $('#su-empty').onclick = () => { setupSkipped = true; location.hash = 'routes'; route(); };
   }
 };
 
@@ -1279,22 +1604,33 @@ const NAV = [
   ['Business', [['tickets', 'Coach tickets', 'ticket'], ['reports', 'Reports', 'chart']]],
   ['Apps', [['driverapp', 'Driver app', 'phone'], ['preferences', 'Preferences', 'sliders']]]
 ];
-const TABS = [['dashboard', 'Overview', 'grid'], ['map', 'Map', 'map'], ['fleet', 'Fleet', 'bus'], ['alerts', 'Alerts', 'bell']];
+const tabsFor = () => role() === 'driver'
+  ? [['driverapp', 'My shift', 'phone'], ['map', 'Map', 'map'], ['schedule', 'Schedule', 'calendar'], ['alerts', 'Alerts', 'bell']]
+  : [['dashboard', 'Overview', 'grid'], ['map', 'Map', 'map'], ['fleet', 'Fleet', 'bus'], ['alerts', 'Alerts', 'bell']];
+let TABS = tabsFor();
+const navName = (k, l) => k === 'driverapp' && role() === 'driver' ? 'My shift' : l;
 
 function shell() {
+  TABS = tabsFor();
+  const cloud = MODE === 'cloud';
   $('#app').innerHTML = `<div class="shell">
     <aside class="rail" aria-label="Main navigation">
-      <a class="brand" href="#dashboard"><span class="brand-mark">${icon('bus')}</span><span><b>HEADWAY</b><small>Bus operations</small></span></a>
-      ${NAV.map(([g, items]) => `<nav class="nav-group"><div class="nav-label">${g}</div>${items.map(([k, l, ic]) => `<a class="nav-item" href="#${k}" data-nav="${k}">${icon(ic)}${l}${k === 'alerts' ? '<span class="count" id="nav-al"></span>' : ''}</a>`).join('')}</nav>`).join('')}
-      <div class="rail-foot"><span>Service clock</span><span class="clock" id="rail-clock">--:--</span><span id="rail-sim"></span></div>
+      <a class="brand" href="#${homeView()}"><span class="brand-mark">${icon('bus')}</span><span><b>HEADWAY</b><small>Bus operations</small></span></a>
+      ${NAV.map(([g, items]) => { const vis = items.filter(([k]) => allowedView(k)); return vis.length ? `<nav class="nav-group"><div class="nav-label">${g}</div>${vis.map(([k, l, ic]) => `<a class="nav-item" href="#${k}" data-nav="${k}">${icon(ic)}${navName(k, l)}${k === 'alerts' ? '<span class="count" id="nav-al"></span>' : ''}</a>`).join('')}</nav>` : ''; }).join('')}
+      <div class="rail-foot"><span>Service clock</span><span class="clock" id="rail-clock">--:--</span><span id="rail-sim"></span>
+        ${cloud ? `<div class="rail-user">${avatarMe()}<div class="ru-txt"><b>${esc(ME.full_name || ME.email)}</b><span>${ROLE_LABEL[ME.role]}</span></div><button class="icon-btn" id="rail-out" aria-label="Sign out" title="Sign out">${icon('logout')}</button></div>`
+          : `<div class="rail-user"><div class="ru-txt"><b>Demo mode</b><span>Data stays in this browser</span></div>${sb ? '<button class="btn sm" id="rail-in">Sign in</button>' : ''}</div>`}
+      </div>
     </aside>
     <div class="main">
       <header class="topbar"><div class="title"><div class="crumb" id="tb-crumb"></div><h1 id="tb-title"></h1></div>
         <div class="top-actions">
+          <span class="mode-pill" id="tb-mode"></span>
           <span class="sim-pill" id="tb-sim" hidden>${icon('clock')}Simulated day</span>
           <button class="searchbox" id="tb-search" aria-label="Search">${icon('search')}<span>Search buses, drivers, lines</span><kbd>Ctrl K</kbd></button>
           <button class="icon-btn" id="tb-bell" aria-label="Notifications">${icon('bell')}<span class="dot" id="tb-dot" hidden></span></button>
           <button class="icon-btn" id="tb-theme" aria-label="Toggle theme"></button>
+          ${cloud ? `<a class="icon-btn me-btn" href="#preferences" aria-label="Account" title="${esc(ME.full_name || '')} · ${ROLE_LABEL[ME.role]}">${avatarMe('sm')}</a>` : ''}
         </div></header>
       <main class="view" id="view" tabindex="-1"></main>
     </div>
@@ -1304,14 +1640,15 @@ function shell() {
   $('#tb-bell').onclick = bellPopover;
   $('#tb-theme').onclick = () => setTheme(isDark() ? 'light' : 'dark');
   $('#tab-more').onclick = e => { e.preventDefault(); moreSheet(); };
-  document.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); palette(); } });
-  document.addEventListener('click', e => { const g = e.target.closest('[data-go]'); if (g && !e.target.closest('.bus-m')) { location.hash = g.dataset.go; } });
-  document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.matches?.('[data-go],.bus-card')) e.target.click(); });
+  $('#rail-out')?.addEventListener('click', signOut);
+  $('#rail-in')?.addEventListener('click', toSignIn);
 }
 function moreSheet() {
-  const all = NAV.flatMap(([, items]) => items).filter(([k]) => !TABS.some(t => t[0] === k));
-  $('#overlay').innerHTML = `<div class="backdrop sheet-backdrop"><div class="sheet" role="dialog" aria-label="More"><div class="grab"></div><div class="sheet-grid">${all.map(([k, l, ic]) => `<a href="#${k}">${icon(ic)}${l}</a>`).join('')}</div></div></div>`;
+  const all = NAV.flatMap(([, items]) => items).filter(([k]) => allowedView(k) && !TABS.some(t => t[0] === k));
+  $('#overlay').innerHTML = `<div class="backdrop sheet-backdrop"><div class="sheet" role="dialog" aria-label="More"><div class="grab"></div><div class="sheet-grid">${all.map(([k, l, ic]) => `<a href="#${k}">${icon(ic)}${navName(k, l)}</a>`).join('')}</div>
+    ${MODE === 'cloud' ? `<div class="sheet-user">${avatarMe()}<div class="ru-txt"><b>${esc(ME.full_name || ME.email)}</b><span>${ROLE_LABEL[ME.role]}</span></div><button class="btn sm" id="sheet-out">${icon('logout')}Sign out</button></div>` : ''}</div></div>`;
   $('.backdrop').onclick = e => { if (e.target.classList.contains('backdrop') || e.target.closest('a')) closeOverlay(); };
+  $('#sheet-out')?.addEventListener('click', signOut);
   document.addEventListener('keydown', escClose);
 }
 function bellPopover() {
@@ -1324,10 +1661,10 @@ function bellPopover() {
 }
 function palette() {
   const items = [
-    ...NAV.flatMap(([, it]) => it).map(([k, l, ic]) => ({ k: 'page', label: l, ic, go: () => { location.hash = k; } })),
-    ...S.buses.map(b => ({ k: 'bus', label: `${b.id} · ${b.plate} · ${b.model}`, ic: 'bus', go: () => { if (b.status === 'service') { mapSel = b.id; location.hash = 'map'; } else { location.hash = 'fleet'; setTimeout(() => busModal(b), 50); } } })),
-    ...S.drivers.map(d => ({ k: 'driver', label: `${d.name} · ${d.id}`, ic: 'user', go: () => { location.hash = 'drivers'; setTimeout(() => driverModal(d), 50); } })),
-    ...S.routes.map(r => ({ k: 'line', label: `Line ${r.id} · ${r.name}`, ic: 'route', go: () => { location.hash = 'routes'; } })),
+    ...NAV.flatMap(([, it]) => it).filter(([k]) => allowedView(k)).map(([k, l, ic]) => ({ k: 'page', label: navName(k, l), ic, go: () => { location.hash = k; } })),
+    ...S.buses.map(b => ({ k: 'bus', label: `${b.id} · ${b.plate} · ${b.model}`, ic: 'bus', go: () => { if (b.status === 'service') { mapSel = b.id; location.hash = 'map'; } else if (allowedView('fleet')) { location.hash = 'fleet'; setTimeout(() => busModal(b), 50); } } })),
+    ...(allowedView('drivers') ? S.drivers.map(d => ({ k: 'driver', label: `${d.name} · ${d.id}`, ic: 'user', go: () => { location.hash = 'drivers'; setTimeout(() => driverModal(d), 50); } })) : []),
+    ...S.routes.map(r => ({ k: 'line', label: `Line ${r.id} · ${r.name}`, ic: 'route', go: () => { location.hash = allowedView('routes') ? 'routes' : 'map'; } })),
     ...STOPS.map(s => ({ k: 'stop', label: s.name, ic: 'pin', go: () => { location.hash = 'map'; setTimeout(() => VIEWS.map.pz?.focus(s.x, s.y), 60); } }))
   ];
   $('#overlay').innerHTML = `<div class="backdrop palette"><div class="box" role="dialog" aria-label="Search"><div class="in">${icon('search')}<input id="pal-q" placeholder="Jump to a bus, driver, line, stop or page" autocomplete="off"></div><ul id="pal-l"></ul></div></div>`;
@@ -1350,6 +1687,7 @@ function palette() {
   draw(); $('#pal-q').focus();
 }
 function updateChrome() {
+  if (!S) return;
   const n = openAlerts().length;
   const set = (el, v) => { if (el) { el.textContent = v || ''; el.hidden = !v; } };
   set($('#nav-al'), n); set($('#tab-al'), n); set($('#tb-dot'), n);
@@ -1357,32 +1695,167 @@ function updateChrome() {
   if ($('#rail-clock')) $('#rail-clock').textContent = fmtTime(m) + ':' + pad(new Date().getSeconds());
   const sim = inSimulatedHours();
   if ($('#tb-sim')) $('#tb-sim').hidden = !sim;
-  if ($('#rail-sim')) $('#rail-sim').textContent = S.settings.paused ? 'Simulation paused' : sim ? `Simulated service day · ${S.settings.speed}×` : `Live service · sim ${S.settings.speed}×`;
+  if ($('#rail-sim')) $('#rail-sim').textContent = sim ? `Simulated service day · ${S.settings.speed}×` : `Live service clock · sim ${S.settings.speed}×`;
+  const mode = $('#tb-mode');
+  if (mode) {
+    const st = MODE === 'cloud' ? (LIVE ? ['ok', 'Live · synced'] : ['warn', 'Connecting…']) : ['', 'Demo data'];
+    mode.className = `mode-pill ${st[0]}`; mode.textContent = st[1];
+  }
   if ($('#tb-theme')) $('#tb-theme').innerHTML = icon(isDark() ? 'sun' : 'moon');
 }
+
+// ---------------------------------------------------------------- sign-in
+const loadingHtml = msg => `<div class="auth-loading">${icon('bus')}<span>${esc(msg)}</span></div>`;
+const authMsg = e => {
+  const m = e?.message || '';
+  if (/invalid login/i.test(m)) return 'That email and password don’t match an account.';
+  if (/not confirmed/i.test(m)) return 'Confirm your email first: open the link we sent you, then sign in.';
+  if (/already registered/i.test(m)) return 'An account with this email already exists. Sign in instead.';
+  if (/rate limit|too many/i.test(m)) return 'Too many attempts. Wait a minute, then try again.';
+  if (/fetch|network/i.test(m)) return 'Can’t reach the server. Check your connection and try again.';
+  return esc(m || 'Something went wrong. Try again.');
+};
+function authScreen(mode = 'signin', note = '', isErr = false) {
+  closeOverlay(); current = null;
+  const T = {
+    signin: ['Sign in', 'Sign in to your team’s operations console.', 'Sign in'],
+    signup: ['Create your account', 'The first account becomes the workspace admin. Everyone after starts as Viewer until an admin assigns a role.', 'Create account'],
+    reset: ['Reset your password', 'Enter your email and we’ll send you a link to choose a new password.', 'Send reset link'],
+    newpw: ['Choose a new password', 'Use at least 8 characters.', 'Save password']
+  }[mode];
+  $('#app').innerHTML = `<div class="auth">
+    <section class="auth-brand">
+      <div class="brand"><span class="brand-mark">${icon('bus')}</span><span><b>HEADWAY</b><small>Bus operations</small></span></div>
+      <div class="auth-pitch"><h1>Every bus, every driver, one console.</h1><p>Live fleet tracking, dispatch, workshop and ticketing, shared with your whole team in real time.</p></div>
+      <div class="board auth-board" aria-hidden="true">
+        ${[['12', '#e4572e', 'Science Park', '2 min'], ['27', '#13998a', 'Airport', '6 min'], ['X1', '#b8741a', 'Airport Express', '14 min']].map(([id, c, d, t]) => `<div class="board-row"><span class="line-bullet" style="background:${c}">${id}</span><span class="dest">${d}</span><span class="due">${t}</span></div>`).join('')}
+      </div>
+    </section>
+    <section class="auth-main">
+      <form class="auth-card" id="auth-form" novalidate>
+        <h2>${T[0]}</h2><p class="muted auth-lead">${T[1]}</p>
+        ${note ? `<div class="auth-note ${isErr ? 'err' : ''}" role="status">${note}</div>` : ''}
+        ${mode === 'signup' ? field({ id: 'name', label: 'Full name', placeholder: 'e.g. Amara Okafor' }) : ''}
+        ${mode !== 'newpw' ? field({ id: 'email', label: 'Email', type: 'email', placeholder: 'you@company.com' }) : ''}
+        ${mode !== 'reset' ? field({ id: 'password', label: mode === 'newpw' ? 'New password' : 'Password', type: 'password', hint: mode === 'signup' ? 'At least 8 characters' : '' }) : ''}
+        <button class="btn primary auth-submit" type="submit" id="auth-go">${T[2]}</button>
+        <div class="auth-links">
+          ${mode === 'signin' ? `<button type="button" class="link" data-mode="reset">Forgot password?</button><span>New here? <button type="button" class="link" data-mode="signup">Create an account</button></span>` : ''}
+          ${mode === 'signup' || mode === 'reset' ? `<span>Have an account? <button type="button" class="link" data-mode="signin">Sign in</button></span>` : ''}
+        </div>
+        ${mode !== 'newpw' ? `<div class="auth-or"><span>or</span></div><button type="button" class="btn auth-demo" id="auth-demo">${icon('play')}Explore the demo without an account</button>` : ''}
+      </form>
+    </section></div>`;
+  $('#f-email')?.setAttribute('autocomplete', 'email');
+  $('#f-name')?.setAttribute('autocomplete', 'name');
+  $('#f-password')?.setAttribute('autocomplete', mode === 'signin' ? 'current-password' : 'new-password');
+  $$('[data-mode]').forEach(b => b.onclick = () => authScreen(b.dataset.mode));
+  $('#auth-demo')?.addEventListener('click', startLocal);
+  $('#auth-form').onsubmit = async e => {
+    e.preventDefault();
+    const f = readForm(e.target); const btn = $('#auth-go');
+    const fail = msg => {
+      btn.disabled = false; btn.textContent = T[2];
+      let n = $('.auth-note'); if (!n) { n = document.createElement('div'); $('.auth-lead').after(n); }
+      n.className = 'auth-note err'; n.setAttribute('role', 'alert'); n.innerHTML = msg;
+    };
+    if (mode !== 'newpw' && !/^\S+@\S+\.\S+$/.test(f.email || '')) return fail('Enter a valid email address.');
+    if ((mode === 'signup' || mode === 'newpw') && (f.password || '').length < 8) return fail('Use a password of at least 8 characters.');
+    if (mode === 'signin' && !f.password) return fail('Enter your password.');
+    btn.disabled = true; btn.textContent = 'Please wait…';
+    try {
+      const back = location.origin + location.pathname;
+      if (mode === 'signin') { const { error } = await sb.auth.signInWithPassword({ email: f.email, password: f.password }); if (error) throw error; return startCloud(); }
+      if (mode === 'signup') {
+        const { data, error } = await sb.auth.signUp({ email: f.email, password: f.password, options: { data: { full_name: f.name || f.email.split('@')[0] }, emailRedirectTo: back } });
+        if (error) throw error;
+        if (data.session) return startCloud();
+        return authScreen('signin', `<b>Check your inbox.</b> We sent a confirmation link to ${esc(f.email)}. Open it, then sign in here.`);
+      }
+      if (mode === 'reset') { const { error } = await sb.auth.resetPasswordForEmail(f.email, { redirectTo: back }); if (error) throw error; return authScreen('signin', `If ${esc(f.email)} has an account, a reset link is on its way.`); }
+      if (mode === 'newpw') { const { error } = await sb.auth.updateUser({ password: f.password }); if (error) throw error; toast('Password updated'); return startCloud(); }
+    } catch (err) { fail(authMsg(err)); }
+  };
+}
+
+// ---------------------------------------------------------------- start-up
+function teardownCloud() {
+  if (channel && sb) { sb.removeChannel(channel); channel = null; }
+  clearTimeout(syncTimer);
+  LIVE = false; MODE = 'local'; ME = null; S = null; current = null; snap = {}; setupSkipped = false; mapSel = null; lastTicket = null;
+}
+async function startCloud() {
+  $('#app').innerHTML = loadingHtml('Loading your workspace…');
+  try {
+    const { data: { user }, error: ue } = await sb.auth.getUser();
+    if (ue || !user) return authScreen('signin');
+    const { data: prof, error } = await sb.from('profiles').select('*').eq('id', user.id).single();
+    if (error) throw error;
+    teardownCloud();
+    ME = prof; MODE = 'cloud';
+    await loadCloud();
+    subscribeCloud();
+    startApp();
+  } catch (e) {
+    teardownCloud();
+    authScreen('signin', `<b>Couldn’t load your workspace.</b> ${authMsg(e)}`, true);
+  }
+}
+function startLocal() {
+  teardownCloud();
+  S = store.load(); if (!S || S.v !== 2) S = seedState();
+  TRIPS = buildTrips(); simulate(); startApp();
+}
+function startApp() { shell(); route(); }
+async function signOut() { teardownCloud(); try { await sb.auth.signOut(); } catch (e) {} authScreen('signin', 'You are signed out.'); }
+function toSignIn() { if (S && MODE === 'local') store.save(S); teardownCloud(); authScreen('signin'); }
 
 // ---------------------------------------------------------------- router + loop
 let current = null;
 function route() {
+  if (!S || !$('#view')) return;
   const name = location.hash.slice(1);
-  const key = VIEWS[name] ? name : 'dashboard';
+  let key = VIEWS[name] && name !== 'setup' ? name : homeView();
+  if (!allowedView(key)) key = homeView();
+  if (needsSetup() && key !== 'preferences') key = 'setup';
   current = VIEWS[key];
   closeOverlay();
   $$('[data-nav]').forEach(a => a.classList.toggle('active', a.dataset.nav === key));
   $$('[data-tab]').forEach(a => a.classList.toggle('active', a.dataset.tab === key || (a.dataset.tab === 'more' && !TABS.some(t => t[0] === key))));
-  $('#tb-title').textContent = current.title; $('#tb-crumb').textContent = current.crumb;
-  document.title = `${current.title} · Headway`;
+  const val = v => typeof v === 'function' ? v() : v;
+  $('#tb-title').textContent = val(current.title); $('#tb-crumb').textContent = val(current.crumb);
+  document.title = `${val(current.title)} · Headway`;
   const v = $('#view'); v.innerHTML = ''; current.render(v);
   updateChrome();
 }
-function boot() {
-  const t = getTheme(); if (t !== 'system') document.documentElement.setAttribute('data-theme', t);
-  shell(); route();
-  window.addEventListener('hashchange', () => { route(); window.scrollTo(0, 0); });
+function globalListeners() {
+  document.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k' && S && $('#tb-search')) { e.preventDefault(); palette(); } });
+  document.addEventListener('click', e => { const g = e.target.closest('[data-go]'); if (g && S && !e.target.closest('.bus-m')) { location.hash = g.dataset.go; } });
+  document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.matches?.('[data-go],.bus-card')) e.target.click(); });
+  window.addEventListener('hashchange', () => { if (!S || !$('#view')) return; route(); window.scrollTo(0, 0); });
   matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', updateChrome);
-  setInterval(() => { simulate(); try { current?.tick?.(); } catch (e) { console.error(e); } updateChrome(); }, 1000);
-  setInterval(save, 5000);
-  window.addEventListener('pagehide', save);
+  setInterval(() => { if (!S || !current) return; simulate(); try { current.tick?.(); } catch (e) { console.error(e); } updateChrome(); }, 1000);
+  setInterval(() => { if (S && MODE === 'local') save(); }, 5000);
+  window.addEventListener('pagehide', () => { if (S && MODE === 'local') store.save(S); });
+}
+async function boot() {
+  const t = getTheme(); if (t !== 'system') document.documentElement.setAttribute('data-theme', t);
+  globalListeners();
+  if (!sb) return startLocal();
+  const params = new URLSearchParams(location.hash.slice(1));
+  const linkErr = params.get('error_description');
+  const recovering = params.get('type') === 'recovery';
+  sb.auth.onAuthStateChange(ev => {
+    if (ev === 'PASSWORD_RECOVERY') setTimeout(() => authScreen('newpw'), 0);
+    if (ev === 'SIGNED_OUT' && MODE === 'cloud') { teardownCloud(); authScreen('signin', 'You have been signed out.'); }
+  });
+  $('#app').innerHTML = loadingHtml('Checking your sign-in…');
+  let session = null;
+  try { session = (await sb.auth.getSession()).data.session; } catch (e) { /* offline: show sign-in */ }
+  if (linkErr) history.replaceState(null, '', location.pathname);
+  if (session && recovering) return authScreen('newpw');
+  if (session) return startCloud();
+  authScreen('signin', linkErr ? esc(linkErr) : '', !!linkErr);
 }
 boot();
 })();
