@@ -224,6 +224,8 @@ function nowMin() {
 }
 const inSimulatedHours = () => { const d = new Date(); const m = d.getHours() * 60 + d.getMinutes(); return !(m >= 330 && m < 1380); };
 
+// seats are sold per service day; older bookings stay in S (demo mode) but never block today's seats
+const bookingsToday = () => S.bookings.filter(b => b.date === localDate());
 function coachDepartures() { const out = []; for (let m = 6 * 60; m <= 22 * 60; m += 60) out.push(m); return out; }
 
 // ---------------------------------------------------------------- state
@@ -550,7 +552,7 @@ function simulate() {
     if (b.energy < 15) raiseAlert({ id: `low-${b.id}-${localDate()}`, severity: 'warning', title: b.fuel === 'Electric' ? 'Low battery' : 'Low fuel', detail: `${b.id} at ${Math.round(b.energy)}%. Plan a swap at the next layover.`, busId: b.id, type: 'energy' });
   }
   S.passengersToday = paxSoFar();
-  S.revenueToday = S.passengersToday * 1.74 + S.bookings.reduce((a, bk) => a + (+bk.fare || 0), 0);
+  S.revenueToday = S.passengersToday * 1.74 + bookingsToday().reduce((a, bk) => a + (+bk.fare || 0), 0);
   // scripted incidents: one decision per 150-second window, identical on every device and stored once
   const win = Math.floor(Date.now() / 150000); const key = `sim-${win}`;
   if (rand01(key) < .4) {
@@ -1205,16 +1207,17 @@ VIEWS.tickets = {
     const m = nowMin(); const deps = coachDepartures();
     if (tkDep == null || tkDep < m - 1) tkDep = deps.find(d => d > m) ?? deps[deps.length - 1];
     const seatsTotal = coach.seats || 44;
-    const taken = new Set(S.bookings.filter(b => b.dep === tkDep).map(b => b.seat));
+    const today = bookingsToday(); const depBookings = today.filter(b => b.dep === tkDep);
+    const taken = new Set(depBookings.map(b => b.seat));
     const fare = coach.fare;
     el.innerHTML = `<div class="book-grid">
       <div class="card"><div class="card-h"><h3>Departures</h3><span class="sub">${esc(coach.name)}</span></div><div class="dep-list">
-        ${deps.filter(d => d >= m).map(d => { const left = seatsTotal - S.bookings.filter(b => b.dep === d).length; return `<button class="dep ${d === tkDep ? 'sel' : ''}" data-dep="${d}"><span class="tm">${fmtTime(d)}</span><span class="muted" style="font-size:12.5px">${left} seats left</span>${left < 8 ? '<span class="chip warn nodot">Few left</span>' : '<span></span>'}</button>`; }).join('') || '<p class="muted">No more departures today.</p>'}
+        ${deps.filter(d => d >= m).map(d => { const left = seatsTotal - today.filter(b => b.dep === d).length; return `<button class="dep ${d === tkDep ? 'sel' : ''}" data-dep="${d}"><span class="tm">${fmtTime(d)}</span><span class="muted" style="font-size:12.5px">${left} seats left</span>${left < 8 ? '<span class="chip warn nodot">Few left</span>' : '<span></span>'}</button>`; }).join('') || '<p class="muted">No more departures today.</p>'}
       </div>${deps.some(d => d < m) ? `<p class="muted" style="font-size:12.5px;margin:10px 0 0">${deps.filter(d => d < m).length} earlier departures have left.</p>` : ''}</div>
       <div class="card"><div class="card-h"><h3>Choose a seat</h3><span class="sub">${fmtTime(tkDep)} departure · ${seatsTotal - taken.size} free</span><span class="spacer"></span>
         <div class="legend"><span><i style="background:var(--surface);border:1.5px solid var(--line)"></i>Free</span><span><i style="background:var(--line)"></i>Taken</span><span><i style="background:var(--accent)"></i>Selected</span></div></div>
         <div class="coach"><div class="front"><span>${icon('user')} Driver</span><span>${icon('door')} Door</span></div><div class="seats">
-        ${(() => { let h = ''; let n = 1; for (let row = 0; row < 11; row++) { for (let c = 0; c < 5; c++) { if (c === 2) { h += '<span></span>'; continue; } if (row === 5 && c > 2) { h += '<span class="seat door"></span>'; continue; } if (n > seatsTotal) { h += '<span></span>'; continue; } const tk = taken.has(n); h += `<button class="seat ${tk ? 'taken' : ''} ${tkSeat === n ? 'sel' : ''}" data-seat="${n}" ${tk ? 'disabled aria-label="Seat ' + n + ' taken"' : 'aria-label="Seat ' + n + '"'}>${n}</button>`; n++; } } return h; })()}
+        ${(() => { let h = ''; let n = 1; for (let row = 0; n <= seatsTotal; row++) { for (let c = 0; c < 5; c++) { if (c === 2) { h += '<span></span>'; continue; } if (row === 5 && c > 2) { h += '<span class="seat door"></span>'; continue; } if (n > seatsTotal) { h += '<span></span>'; continue; } const tk = taken.has(n); h += `<button class="seat ${tk ? 'taken' : ''} ${tkSeat === n ? 'sel' : ''}" data-seat="${n}" ${tk ? 'disabled aria-label="Seat ' + n + ' taken"' : 'aria-label="Seat ' + n + '"'}>${n}</button>`; n++; } } return h; })()}
         </div></div></div>
       <div style="display:flex;flex-direction:column;gap:16px">
         <div class="card"><div class="card-h"><h3>Passenger</h3></div><div style="display:flex;flex-direction:column;gap:12px">
@@ -1224,9 +1227,9 @@ VIEWS.tickets = {
           <button class="btn primary" id="tk-issue" ${tkSeat ? '' : 'disabled'} style="justify-content:center">${icon('ticket')}Issue ticket</button></div></div>
         <div id="tk-last"></div>
       </div></div>
-      <div class="card"><div class="card-h"><h3>Bookings for ${fmtTime(tkDep)}</h3><span class="sub">${taken.size} passengers · ${money(S.bookings.filter(b => b.dep === tkDep).reduce((a, b) => a + b.fare, 0))}</span></div>
+      <div class="card"><div class="card-h"><h3>Bookings for ${fmtTime(tkDep)}</h3><span class="sub">${taken.size} passengers · ${money(depBookings.reduce((a, b) => a + b.fare, 0))}</span></div>
         <div class="table-wrap"><table class="t"><thead><tr><th>Ticket</th><th>Seat</th><th>Name</th><th>Fare</th><th>Amount</th><th></th></tr></thead><tbody>
-        ${S.bookings.filter(b => b.dep === tkDep).sort((a, b) => a.seat - b.seat).map(b => `<tr style="cursor:default"><td class="mono">${b.id}</td><td>${b.seat}</td><td>${esc(b.name)}</td><td>${b.type}</td><td>${money(b.fare)}</td><td style="text-align:right"><button class="btn sm ghost danger" data-refund="${b.id}">Refund</button></td></tr>`).join('')}
+        ${[...depBookings].sort((a, b) => a.seat - b.seat).map(b => `<tr style="cursor:default"><td class="mono">${b.id}</td><td>${b.seat}</td><td>${esc(b.name)}</td><td>${b.type}</td><td>${money(b.fare)}</td><td style="text-align:right"><button class="btn sm ghost danger" data-refund="${b.id}">Refund</button></td></tr>`).join('')}
         </tbody></table></div></div>`;
     $$('[data-dep]', el).forEach(b => b.onclick = () => { tkDep = +b.dataset.dep; tkSeat = null; this.render(el); });
     $$('[data-seat]', el).forEach(b => b.onclick = () => { tkSeat = +b.dataset.seat; $$('.seat.sel', el).forEach(s => s.classList.remove('sel')); b.classList.add('sel'); $('#tk-seat-l').textContent = 'No. ' + tkSeat; $('#tk-issue').disabled = false; });

@@ -1,5 +1,5 @@
 // Offline-first service worker: app shell is cached, everything else goes network-first.
-const CACHE = 'headway-v2';
+const CACHE = 'headway-v3';
 const SHELL = ['./', './index.html', './app.css', './app.js', './config.js', './icon.svg', './manifest.webmanifest'];
 
 self.addEventListener('install', e => {
