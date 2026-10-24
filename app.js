@@ -1719,7 +1719,7 @@ function authScreen(mode = 'signin', note = '', isErr = false) {
   closeOverlay(); current = null;
   const T = {
     signin: ['Sign in', 'Sign in to your team’s operations console.', 'Sign in'],
-    signup: ['Create your account', 'The first account becomes the workspace admin. Everyone after starts as Viewer until an admin assigns a role.', 'Create account'],
+    signup: ['Create your account', 'New accounts start as Viewer until an admin assigns a role.', 'Create account'],
     reset: ['Reset your password', 'Enter your email and we’ll send you a link to choose a new password.', 'Send reset link'],
     newpw: ['Choose a new password', 'Use at least 8 characters.', 'Save password']
   }[mode];

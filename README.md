@@ -8,7 +8,7 @@ Plain HTML, CSS and JavaScript with no build step. It is responsive (sidebar on 
 
 Data, sign-in and live updates run on [Supabase](https://supabase.com) (project `headway-bus-ops`, Frankfurt).
 
-- **Sign-in:** email and password. The first account becomes the admin; everyone after starts as Viewer.
+- **Sign-in:** email and password. Addresses listed in the database table `private.admin_emails` become Admin when they sign up; everyone else starts as Viewer.
 - **Shared data:** lines, fleet, drivers, alerts, work orders, coach bookings, dispatch messages, trip changes, driver shifts and workspace settings live in Postgres.
 - **Live updates:** every open screen receives changes from other users instantly (Supabase Realtime).
 - **Roles,** enforced by row level security in the database, not only in the UI:
